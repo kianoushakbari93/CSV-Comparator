@@ -57,6 +57,8 @@ python csv_comparator.py source.csv target.csv ID TRADE_DATE ACCOUNT_ID
 - `key_columns` - Optional: Space-separated list of key columns
 - `--output-dir DIR` - Directory to save the discrepancy report
 - `--no-normalisation` - Disable value normalisation
+- `--decimal-precision N` - Number of decimal places for numeric comparison (default: 6)
+- `-v, --verbose` - Enable verbose/debug logging
 
 ### Examples
 
@@ -72,6 +74,12 @@ python csv_comparator.py hive_export.csv snowflake_export.csv --output-dir ./rep
 
 # Disable normalisation for strict comparison
 python csv_comparator.py hive_export.csv snowflake_export.csv --no-normalisation
+
+# Use 10 decimal places for high-precision financial data
+python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precision 10
+
+# Use 2 decimal places for currency values
+python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precision 2
 ```
 
 ### Interactive Mode
@@ -108,6 +116,9 @@ The comparator normalises values to handle common differences between Hive and S
 **Numbers:**
 - `123.000`, `123.0` -> `123`
 - `1,234,567` -> `1234567`
+- Decimal values are rounded to 6 decimal places by default
+
+Use `--decimal-precision N` to change the number of decimal places used for numeric comparison. For example, `--decimal-precision 2` for currency values or `--decimal-precision 10` for high-precision scientific data.
 
 Use `--no-normalisation` to disable this behaviour for strict byte-for-byte comparison.
 

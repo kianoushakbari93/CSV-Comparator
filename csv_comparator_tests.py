@@ -1090,18 +1090,19 @@ def run_unit_tests(comparator_path):
     # Test normalise_chunk_parallel
     normalise_chunk_parallel = module.normalise_chunk_parallel
     chunk_df = pd.DataFrame({"A": ["true", "FALSE", "100.00"], "B": ["NULL", "test", "200"]})
-    result_df = normalise_chunk_parallel((chunk_df.copy(), False))
-    
-    if result_df["A"].iloc[0] == "true" and result_df["B"].iloc[0] is None:
+    result_df = normalise_chunk_parallel((chunk_df.copy(), False, 6))  # Added decimal_precision arg
+
+    # Note: pandas converts None to np.nan, so we use pd.isna() for null checking
+    if result_df["A"].iloc[0] == "true" and pd.isna(result_df["B"].iloc[0]):
         passed += 1
     else:
         failed += 1
         print(f"      [X] normalise_chunk_parallel: normalisation failed")
-    
+
     # Test compute_hashes_chunk_parallel
     compute_hashes_chunk_parallel = module.compute_hashes_chunk_parallel
     chunk_df = pd.DataFrame({"A": ["1", "2"], "B": ["Alice", "Bob"]})
-    result_df = compute_hashes_chunk_parallel((chunk_df.copy(), ["A", "B"], False))
+    result_df = compute_hashes_chunk_parallel((chunk_df.copy(), ["A", "B"], False, 6))  # Added decimal_precision arg
     
     if "_ROW_HASH_" in result_df.columns and len(result_df["_ROW_HASH_"].unique()) == 2:
         passed += 1
@@ -1112,7 +1113,7 @@ def run_unit_tests(comparator_path):
     # Test detect_duplicates_hash_chunk
     detect_duplicates_hash_chunk = module.detect_duplicates_hash_chunk
     chunk_df = pd.DataFrame({"A": ["1", "1", "2"], "B": ["X", "X", "Y"]})
-    results = detect_duplicates_hash_chunk((chunk_df, ["A", "B"], False))
+    results = detect_duplicates_hash_chunk((chunk_df, ["A", "B"], False, 6))  # Added decimal_precision arg
     
     if len(results) == 3:  # Should return (index, hash) for each row
         passed += 1

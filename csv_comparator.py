@@ -10,7 +10,10 @@ Features:
 - Optimised for tables with millions of rows
 """
 
+from __future__ import annotations
+
 import pandas as pd
+import numpy as np
 import sys
 import re
 import os
@@ -18,60 +21,118 @@ import csv
 import hashlib
 import tempfile
 import argparse
+import logging
 import multiprocessing as mp
 from datetime import datetime
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
+from typing import Any, Optional, Dict, List, Tuple, Set, DefaultDict
 
 
-def normalise_value(value, skip_normalisation=False):
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# CONSTANTS - Column exclusion patterns for key detection
+# =============================================================================
+
+# Column name patterns to ALWAYS avoid as keys
+COLUMN_EXCLUSION_PATTERNS: List[str] = [
+    r'.*_?DESC.*', r'.*_?DESCRIPTION.*', r'.*_?COMMENT.*', r'.*_?NOTE.*', r'.*_?TEXT.*',
+    r'.*_?AMOUNT.*', r'.*_?VALUE.*', r'.*_?PRICE.*', r'.*_?QUANTITY.*', r'.*_?QTY.*',
+    r'.*_?BALANCE.*', r'.*_?TOTAL.*', r'.*_?PERCENT.*', r'.*_?PCT.*', r'.*_?RATIO.*', r'.*_?RATE.*',
+    r'CREATED.*', r'UPDATED.*', r'MODIFIED.*',
+    r'.*_?TIMESTAMP.*', r'.*_?DATETIME.*', r'.*_?TIME$', r'.*_?DT$', r'.*_?TS$',
+    r'.*_?FILE.*', r'.*_?PATH.*', r'.*_?FILENAME.*',
+    r'.*_?LOAD.*', r'.*_?ETL.*', r'.*_?BATCH.*', r'.*_?RUN.*', r'.*_?PROCESS.*',
+    r'.*_?AUDIT.*', r'.*_?INSERT.*', r'.*_?UPDATE.*',
+    r'^ROW_.*', r'.*_?SOURCE$', r'.*_?SRC$', r'.*_?NAME$', r'^NAME_?.*',
+    r'.*_?STATUS.*', r'.*_?FLAG.*', r'.*_?IND$', r'.*_?INDICATOR.*',
+]
+
+# Default timestamp precision (number of decimal places to preserve, None = strip all)
+DEFAULT_TIMESTAMP_PRECISION: Optional[int] = None
+
+# Default numeric precision for rounding
+DEFAULT_NUMERIC_PRECISION: int = 6
+
+
+def normalise_value(
+    value: Any,
+    skip_normalisation: bool = False,
+    timestamp_precision: Optional[int] = DEFAULT_TIMESTAMP_PRECISION,
+    numeric_precision: int = DEFAULT_NUMERIC_PRECISION
+) -> Optional[str]:
     """
     Normalise values for consistent comparison.
     Preserves whitespace exactly as-is for strict validation.
     Handles nulls, numeric formatting, timestamps, and booleans.
     Does NOT convert ambiguous date formats (DD/MM/YYYY vs MM/DD/YYYY).
-    
-    If skip_normalisation=True, returns value as-is (string conversion only).
+
+    Args:
+        value: The value to normalise
+        skip_normalisation: If True, returns value as-is (string conversion only)
+        timestamp_precision: Number of decimal places to preserve in timestamps.
+                           None = strip all decimals (default for backwards compatibility)
+        numeric_precision: Number of decimal places for numeric rounding (default: 6)
+
+    Returns:
+        Normalised string value or None for null values
     """
     if pd.isna(value):
         return None
-    
+
     str_value = str(value)
-    
+
     # If skipping normalisation, just return string value (but still handle pandas NA)
     if skip_normalisation:
         if str_value.lower().strip() in ['', 'nan', 'nat']:
             return None
         return str_value
-    
+
     # Check for null values (but preserve whitespace in actual data)
     if str_value.lower().strip() in ['', 'null', 'none', 'nan', 'nat', 'n/a', 'na', '#n/a']:
         return None
-    
+
     stripped = str_value.strip()
-    
+
     # Normalise boolean values to lowercase true/false
     # Note: '0' and '1' are intentionally excluded to avoid false positives with numeric data
     if stripped.lower() in ['true', 'yes', 'y']:
         return 'true'
     if stripped.lower() in ['false', 'no', 'n']:
         return 'false'
-    
-    # Normalise timestamp formats - strip ALL decimal places
-    # Format: YYYY-MM-DD HH:MM:SS.fffffffff -> YYYY-MM-DD HH:MM:SS
+
+    # Normalise timestamp formats
+    # Format: YYYY-MM-DD HH:MM:SS.fffffffff -> YYYY-MM-DD HH:MM:SS[.fff]
     timestamp_match = re.match(r'^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})\.(\d+)$', stripped)
     if timestamp_match:
         datetime_part = timestamp_match.group(1).replace('T', ' ')
-        return datetime_part
-    
+        fractional_part = timestamp_match.group(2)
+
+        if timestamp_precision is None or timestamp_precision == 0:
+            return datetime_part
+        else:
+            # Truncate or pad fractional seconds to specified precision
+            truncated = fractional_part[:timestamp_precision].ljust(timestamp_precision, '0')
+            return f"{datetime_part}.{truncated}"
+
     # Timestamp without fractional seconds - return as-is
     if re.match(r'^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}$', stripped):
         return stripped.replace('T', ' ')
-    
+
     # DO NOT convert DD/MM/YYYY or MM/DD/YYYY formats - they are ambiguous
     # Leave them exactly as-is in the source data
-    
+
     # ISO format YYYY-MM-DD: validate but don't convert (already in correct format)
     iso_date_match = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', stripped)
     if iso_date_match:
@@ -79,7 +140,7 @@ def normalise_value(value, skip_normalisation=False):
         # Only accept as valid ISO date if values are reasonable
         if 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
             return stripped
-    
+
     # Normalise numeric formatting (only for pure numeric values)
     try:
         clean_num = stripped.replace(',', '')
@@ -87,117 +148,137 @@ def normalise_value(value, skip_normalisation=False):
         if str_value.strip() == str_value:
             if float_val.is_integer():
                 return str(int(float_val))
-            # Round to 6 decimal places for consistent comparison
-            return str(round(float_val, 6))
+            # Round to specified decimal places for consistent comparison
+            return str(round(float_val, numeric_precision))
     except (ValueError, TypeError):
         pass
-    
+
     # Return value exactly as-is, preserving all whitespace
     return str_value
 
 
-def detect_delimiter_for_line(line):
+def detect_delimiter_for_line(line: str) -> str:
     """Detect the most likely delimiter for a single line."""
-    delimiters = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
+    delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
     for delim in delimiters:
         delimiters[delim] = line.count(delim)
-    
+
     best_delim = max(delimiters, key=delimiters.get)
     if delimiters[best_delim] == 0:
         return ','
     return best_delim
 
 
-def detect_delimiters(filepath, sample_lines=10):
+def detect_delimiters(filepath: str, sample_lines: int = 10) -> Tuple[str, str]:
     """
     Detect CSV delimiters separately for header and data rows.
-    
-    Returns tuple: (header_delimiter, row_delimiter)
+
+    Args:
+        filepath: Path to the CSV file
+        sample_lines: Number of data lines to sample for detection
+
+    Returns:
+        Tuple of (header_delimiter, row_delimiter)
     """
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = []
+            lines: List[str] = []
             for _ in range(sample_lines + 1):
                 line = f.readline()
                 if line:
                     lines.append(line.strip())
-        
+
         if not lines:
+            logger.warning(f"Empty file detected: {filepath}, defaulting to comma delimiter")
             return ',', ','
-        
+
         header_line = lines[0]
         header_delim = detect_delimiter_for_line(header_line)
-        
+
         data_lines = lines[1:] if len(lines) > 1 else []
-        
+
         if not data_lines:
             return header_delim, header_delim
-        
-        delimiters = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
+
+        delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
         for line in data_lines:
             for delim in delimiters:
                 delimiters[delim] += line.count(delim)
-        
+
         row_delim = max(delimiters, key=delimiters.get)
         if delimiters[row_delim] == 0:
             row_delim = header_delim
-        
+
         return header_delim, row_delim
-        
-    except Exception:
+
+    except IOError as e:
+        logger.warning(f"Error reading file for delimiter detection: {e}, defaulting to comma")
+        return ',', ','
+    except Exception as e:
+        logger.warning(f"Unexpected error in delimiter detection: {e}, defaulting to comma")
         return ',', ','
 
 
-def preprocess_quoted_rows(filepath):
+def preprocess_quoted_rows(filepath: str) -> Tuple[str, int]:
     """
     Fix rows that are entirely quoted (start with " and end with ").
     Also normalises Windows CRLF line endings to Unix LF.
-    
+
     Some exports wrap entire rows in quotes, e.g.:
         "value1|value2|value3"
     This causes delimiters inside to be treated as data, not separators.
-    
-    Returns: (cleaned_filepath, rows_fixed_count)
+
+    Args:
+        filepath: Path to the CSV file to process
+
+    Returns:
+        Tuple of (cleaned_filepath, rows_fixed_count)
     """
     # First pass: check if any rows need fixing
     rows_needing_quote_fix = 0
     has_crlf = False
-    
+
     with open(filepath, 'rb') as f:
         sample = f.read(65536)
         if b'\r\n' in sample:
             has_crlf = True
-    
+
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         f.readline()  # Skip header
         for line in f:
             stripped = line.rstrip('\r\n')
             if stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 1:
                 rows_needing_quote_fix += 1
-    
+
     if rows_needing_quote_fix == 0 and not has_crlf:
         return filepath, 0
-    
+
     # Second pass: create cleaned file
     temp_fd, temp_path = tempfile.mkstemp(suffix='.csv', prefix='cleaned_')
-    
+
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as infile, \
          os.fdopen(temp_fd, 'w', encoding='utf-8', newline='') as outfile:
-        
+
         for line in infile:
             stripped = line.rstrip('\r\n')
             if stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 1:
                 stripped = stripped[1:-1]
             outfile.write(stripped + '\n')
-    
+
     return temp_path, rows_needing_quote_fix
 
 
 @contextmanager
-def cleaned_csv(filepath):
+def cleaned_csv(filepath: str):
     """
     Context manager for temporary cleaned CSV files.
     Ensures temp files are always cleaned up, even if exceptions occur.
+
+    Args:
+        filepath: Path to the CSV file to process
+
+    Yields:
+        Tuple of (cleaned_filepath, rows_fixed_count)
     """
     cleaned_path, rows_fixed = preprocess_quoted_rows(filepath)
     try:
@@ -206,32 +287,44 @@ def cleaned_csv(filepath):
         if cleaned_path != filepath:
             try:
                 os.remove(cleaned_path)
-            except OSError:
-                pass  # Temp file cleanup is best-effort
+            except OSError as e:
+                logger.debug(f"Failed to clean up temp file {cleaned_path}: {e}")
 
 
-def load_csv_file(filepath, source_name):
-    """Load CSV with automatic delimiter detection and row_text handling."""
+def load_csv_file(filepath: str, source_name: str) -> pd.DataFrame:
+    """
+    Load CSV with automatic delimiter detection and row_text handling.
+
+    Args:
+        filepath: Path to the CSV file
+        source_name: Display name for logging
+
+    Returns:
+        Loaded DataFrame with normalised column names
+    """
     with cleaned_csv(filepath) as (cleaned_filepath, rows_fixed):
         try:
             if rows_fixed > 0:
-                print(f"  [!] Fixed {rows_fixed:,} rows with errant surrounding quotes")
-            
+                logger.info(f"  [!] Fixed {rows_fixed:,} rows with errant surrounding quotes")
+
             header_delim, row_delim = detect_delimiters(cleaned_filepath)
-            header_delim_name = {',': 'comma', '|': 'pipe', '\t': 'tab', '~': 'tilde', ';': 'semicolon'}.get(header_delim, repr(header_delim))
-            row_delim_name = {',': 'comma', '|': 'pipe', '\t': 'tab', '~': 'tilde', ';': 'semicolon'}.get(row_delim, repr(row_delim))
-            
+            delim_names: Dict[str, str] = {
+                ',': 'comma', '|': 'pipe', '\t': 'tab', '~': 'tilde', ';': 'semicolon'
+            }
+            header_delim_name = delim_names.get(header_delim, repr(header_delim))
+            row_delim_name = delim_names.get(row_delim, repr(row_delim))
+
             if header_delim == row_delim:
-                print(f"  Detected delimiter: {header_delim_name}")
+                logger.info(f"  Detected delimiter: {header_delim_name}")
             else:
-                print(f"  Detected header delimiter: {header_delim_name}")
-                print(f"  Detected row delimiter: {row_delim_name}")
-            
+                logger.info(f"  Detected header delimiter: {header_delim_name}")
+                logger.info(f"  Detected row delimiter: {row_delim_name}")
+
             if header_delim != row_delim:
                 df = load_mixed_delimiter_csv(cleaned_filepath, header_delim, row_delim)
             else:
                 quoting_mode = csv.QUOTE_NONE if rows_fixed > 0 else csv.QUOTE_MINIMAL
-                
+
                 df = pd.read_csv(
                     cleaned_filepath,
                     sep=header_delim,
@@ -243,142 +336,161 @@ def load_csv_file(filepath, source_name):
                     engine='c',
                     low_memory=False
                 )
-            
+
             df.columns = df.columns.str.strip().str.upper()
-            
+
             if len(df.columns) == 1 and df.columns[0] in ['ROW_TEXT', 'ROW', 'TEXT', 'DATA', 'LINE']:
-                print(f"  Detected single-column format: {df.columns[0]}")
+                logger.info(f"  Detected single-column format: {df.columns[0]}")
                 df = expand_row_text_column(df)
-                print(f"  Expanded to {len(df.columns)} columns")
-            
-            print(f"  [OK] Loaded {source_name}: {len(df):,} rows, {len(df.columns)} columns")
+                logger.info(f"  Expanded to {len(df.columns)} columns")
+
+            logger.info(f"  [OK] Loaded {source_name}: {len(df):,} rows, {len(df.columns)} columns")
             return df
-            
+
         except Exception as e:
-            print(f"  [X] Error loading {source_name}: {e}")
+            logger.error(f"  [X] Error loading {source_name}: {e}")
             sys.exit(1)
 
 
-def load_mixed_delimiter_csv(filepath, header_delim, row_delim):
+def load_mixed_delimiter_csv(filepath: str, header_delim: str, row_delim: str) -> pd.DataFrame:
     """
     Load CSV where header uses one delimiter but data rows use another.
+
+    Args:
+        filepath: Path to the CSV file
+        header_delim: Delimiter used in header row
+        row_delim: Delimiter used in data rows
+
+    Returns:
+        Loaded DataFrame
     """
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         header_line = f.readline().strip()
         column_names = [col.strip().upper() for col in header_line.split(header_delim)]
-        
-        data_rows = []
+
+        data_rows: List[List[str]] = []
         for line in f:
             line = line.strip()
             if not line:
                 continue
             row_values = line.split(row_delim)
             data_rows.append(row_values)
-    
+
     df = pd.DataFrame(data_rows)
-    
+
     if len(df.columns) == len(column_names):
         df.columns = column_names
     elif len(df.columns) > 0:
-        print(f"  Warning: Column count mismatch (header: {len(column_names)}, data: {len(df.columns)})")
+        logger.warning(f"  Column count mismatch (header: {len(column_names)}, data: {len(df.columns)})")
         if len(df.columns) < len(column_names):
             df.columns = column_names[:len(df.columns)]
         else:
             extra_cols = [f'COL_{i+1}' for i in range(len(column_names), len(df.columns))]
             df.columns = column_names + extra_cols
-    
+
     return df
 
 
-def expand_row_text_column(df):
+def expand_row_text_column(df: pd.DataFrame) -> pd.DataFrame:
     """
     Expand a single row_text column into multiple columns.
     Detects the delimiter used within the data and creates COL_1, COL_2, etc.
+
+    Args:
+        df: DataFrame with a single row_text column
+
+    Returns:
+        DataFrame with expanded columns
     """
     if len(df) == 0:
         return df
-    
+
     col_name = df.columns[0]
     sample_values = df[col_name].head(10).tolist()
-    
-    delimiters = {'|': 0, ',': 0, '\t': 0, ';': 0, '~': 0}
+
+    delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, ';': 0, '~': 0}
     for val in sample_values:
         if pd.notna(val) and val:
             for delim in delimiters:
                 delimiters[delim] += str(val).count(delim)
-    
+
     internal_delim = max(delimiters, key=delimiters.get)
-    
+
     if delimiters[internal_delim] == 0:
         return df
-    
-    delim_name = {'|': 'pipe', ',': 'comma', '\t': 'tab', ';': 'semicolon', '~': 'tilde'}.get(internal_delim, internal_delim)
-    print(f"  Detected internal delimiter: {delim_name}")
-    
-    first_valid = None
+
+    delim_names: Dict[str, str] = {
+        '|': 'pipe', ',': 'comma', '\t': 'tab', ';': 'semicolon', '~': 'tilde'
+    }
+    delim_name = delim_names.get(internal_delim, internal_delim)
+    logger.info(f"  Detected internal delimiter: {delim_name}")
+
+    first_valid: Optional[str] = None
     for val in sample_values:
         if pd.notna(val) and val and internal_delim in str(val):
             first_valid = str(val)
             break
-    
+
     if not first_valid:
         return df
-    
+
     num_cols = len(first_valid.split(internal_delim))
     col_names = [f'COL_{i+1}' for i in range(num_cols)]
-    
-    expanded_data = []
-    for idx, row in df.iterrows():
-        val = row[col_name]
+
+    # Use vectorized string split instead of iterrows
+    def split_and_pad(val: Any) -> List[str]:
         if pd.notna(val) and val:
             parts = str(val).split(internal_delim)
             if len(parts) < num_cols:
                 parts.extend([''] * (num_cols - len(parts)))
             elif len(parts) > num_cols:
                 parts = parts[:num_cols]
-            expanded_data.append(parts)
-        else:
-            expanded_data.append([''] * num_cols)
-    
+            return parts
+        return [''] * num_cols
+
+    expanded_data = df[col_name].apply(split_and_pad).tolist()
+
     return pd.DataFrame(expanded_data, columns=col_names)
 
 
-def detect_composite_key(df, max_columns=10):
+def detect_composite_key(
+    df: pd.DataFrame,
+    max_columns: int = 10,
+    exclusion_patterns: Optional[List[str]] = None
+) -> List[str]:
     """
     Intelligently detect the MINIMUM set of columns needed to uniquely identify rows.
-    
+
     Prioritises columns that are good key candidates:
     - Integer columns (numbers without decimals) - likely IDs, codes
     - Alphanumeric columns (mix of letters and numbers) - like IDs, codes
     - High uniqueness, non-null columns
-    
+
     Excludes columns that are NOT good keys:
     - Decimal numbers (amounts, percentages, prices)
     - Timestamps, filenames, audit columns
     - Pure text (names, descriptions)
     - Boolean/flag columns (low cardinality)
+
+    Args:
+        df: DataFrame to analyse
+        max_columns: Maximum number of columns to consider as key candidates
+        exclusion_patterns: Optional list of regex patterns for columns to exclude.
+                          Uses COLUMN_EXCLUSION_PATTERNS if not provided.
+
+    Returns:
+        List of column names forming the composite key
     """
     if len(df) == 0:
         return list(df.columns)[:3]
-    
+
     total_columns = len(df.columns)
-    print(f"  Total columns: {total_columns}")
-    
-    # Column name patterns to ALWAYS avoid as keys
-    avoid_name_patterns = [
-        r'.*_?DESC.*', r'.*_?DESCRIPTION.*', r'.*_?COMMENT.*', r'.*_?NOTE.*', r'.*_?TEXT.*',
-        r'.*_?AMOUNT.*', r'.*_?VALUE.*', r'.*_?PRICE.*', r'.*_?QUANTITY.*', r'.*_?QTY.*',
-        r'.*_?BALANCE.*', r'.*_?TOTAL.*', r'.*_?PERCENT.*', r'.*_?PCT.*', r'.*_?RATIO.*', r'.*_?RATE.*',
-        r'CREATED.*', r'UPDATED.*', r'MODIFIED.*',
-        r'.*_?TIMESTAMP.*', r'.*_?DATETIME.*', r'.*_?TIME$', r'.*_?DT$', r'.*_?TS$',
-        r'.*_?FILE.*', r'.*_?PATH.*', r'.*_?FILENAME.*',
-        r'.*_?LOAD.*', r'.*_?ETL.*', r'.*_?BATCH.*', r'.*_?RUN.*', r'.*_?PROCESS.*',
-        r'.*_?AUDIT.*', r'.*_?INSERT.*', r'.*_?UPDATE.*',
-        r'^ROW_.*', r'.*_?SOURCE$', r'.*_?SRC$', r'.*_?NAME$', r'^NAME_?.*',
-        r'.*_?STATUS.*', r'.*_?FLAG.*', r'.*_?IND$', r'.*_?INDICATOR.*',
-    ]
-    
-    def analyse_column_values(values):
+    logger.info(f"  Total columns: {total_columns}")
+
+    # Use provided patterns or default to global constant
+    avoid_name_patterns = exclusion_patterns or COLUMN_EXCLUSION_PATTERNS
+
+    def analyse_column_values(values: pd.Series) -> Tuple[str, int]:
         """Analyse column values to determine if it's a good key candidate."""
         sample = values.dropna().head(50).astype(str)
         if len(sample) == 0:
@@ -503,14 +615,14 @@ def detect_composite_key(df, max_columns=10):
     
     if excluded_cols:
         excluded_display = [f"{c}({r})" for c, r in excluded_cols[:5]]
-        print(f"  Excluded {len(excluded_cols)} column(s) from key detection: {', '.join(excluded_display)}" + 
+        logger.info(f"  Excluded {len(excluded_cols)} column(s) from key detection: {', '.join(excluded_display)}" +
               (f" and {len(excluded_cols) - 5} more" if len(excluded_cols) > 5 else ""))
-    
+
     sorted_cols = sorted(col_stats.items(), key=lambda x: -x[1]['priority'])
-    
+
     if sorted_cols:
         top_candidates = [(c, s['col_type'], f"{s['priority']:.0f}") for c, s in sorted_cols[:5]]
-        print(f"  Top key candidates: {', '.join(f'{c}({t})' for c, t, p in top_candidates)}")
+        logger.info(f"  Top key candidates: {', '.join(f'{c}({t})' for c, t, p in top_candidates)}")
     
     candidate_cols = [col for col, _ in sorted_cols[:max_columns]]
     unique_cols = []
@@ -538,77 +650,124 @@ def detect_composite_key(df, max_columns=10):
     combined = df[result].apply(lambda row: '||'.join(str(v) for v in row), axis=1)
     unique_ratio = combined.nunique() / len(df)
     
-    print(f"  Selected {len(result)} key column(s): {', '.join(result)}")
-    print(f"  Composite key uniqueness: {unique_ratio:.4%}")
-    
+    logger.info(f"  Selected {len(result)} key column(s): {', '.join(result)}")
+    logger.info(f"  Composite key uniqueness: {unique_ratio:.4%}")
+
     return result
 
 
-def normalise_chunk_parallel(args):
+def _compute_row_hash(
+    row_values: List[Any],
+    skip_norm: bool = False,
+    decimal_prec: int = DEFAULT_NUMERIC_PRECISION
+) -> str:
+    """
+    Compute a SHA-256 hash for a row of values.
+
+    Args:
+        row_values: List of values to hash
+        skip_norm: Whether to skip normalisation
+        decimal_prec: Number of decimal places for numeric precision
+
+    Returns:
+        Hex digest of the hash (first 32 chars for reasonable length)
+    """
+    normalised = []
+    for v in row_values:
+        norm_v = normalise_value(v, skip_norm, numeric_precision=decimal_prec)
+        normalised.append(str(norm_v) if norm_v is not None else 'NULL')
+    return hashlib.sha256('|'.join(normalised).encode()).hexdigest()[:32]
+
+
+def normalise_chunk_parallel(
+    args: Tuple[pd.DataFrame, bool, int]
+) -> pd.DataFrame:
     """
     Normalise a chunk of the dataframe.
     Used for parallel processing of large tables.
+
+    Args:
+        args: Tuple of (chunk_df, skip_normalisation, decimal_precision)
+
+    Returns:
+        Normalised DataFrame chunk
     """
-    chunk_df, skip_norm = args
+    chunk_df, skip_norm, decimal_prec = args
     for col in chunk_df.columns:
-        chunk_df[col] = chunk_df[col].apply(lambda v: normalise_value(v, skip_norm))
+        chunk_df[col] = chunk_df[col].apply(
+            lambda v: normalise_value(v, skip_norm, numeric_precision=decimal_prec)
+        )
     return chunk_df
 
 
-def compute_hashes_chunk_parallel(args):
+def compute_hashes_chunk_parallel(
+    args: Tuple[pd.DataFrame, List[str], bool, int]
+) -> pd.DataFrame:
     """
     Compute row hashes for a chunk of the dataframe.
     Used for parallel processing of large tables.
+
+    Args:
+        args: Tuple of (chunk_df, columns, skip_normalisation, decimal_precision)
+
+    Returns:
+        DataFrame chunk with _ROW_HASH_ column added
     """
-    chunk_df, columns, skip_norm = args
-    
-    def hash_row(row):
-        normalised = []
-        for v in row:
-            norm_v = normalise_value(v, skip_norm)
-            normalised.append(str(norm_v) if norm_v is not None else 'NULL')
-        return hashlib.md5('|'.join(normalised).encode()).hexdigest()
-    
+    chunk_df, columns, skip_norm, decimal_prec = args
+
+    def hash_row(row: pd.Series) -> str:
+        return _compute_row_hash(row.tolist(), skip_norm, decimal_prec)
+
     chunk_df['_ROW_HASH_'] = chunk_df[columns].apply(hash_row, axis=1)
     return chunk_df
 
 
-def detect_duplicates_hash_chunk(args):
+def detect_duplicates_hash_chunk(
+    args: Tuple[pd.DataFrame, List[str], bool, int]
+) -> List[Tuple[Any, str]]:
     """
     Compute row hashes for duplicate detection in a chunk.
     Returns list of (index, hash) tuples.
     Used for parallel processing.
+
+    Args:
+        args: Tuple of (chunk_df, compare_cols, skip_normalisation, decimal_precision)
+
+    Returns:
+        List of (index, hash) tuples
     """
-    chunk_df, compare_cols, skip_norm = args
-    
-    def row_to_hash(row):
-        normalised = []
-        for v in row:
-            norm_v = normalise_value(v, skip_norm)
-            normalised.append(str(norm_v) if norm_v is not None else 'NULL')
-        return hashlib.md5('|'.join(normalised).encode()).hexdigest()
-    
-    results = []
-    for idx, row in chunk_df.iterrows():
-        row_hash = row_to_hash(row[compare_cols])
-        results.append((idx, row_hash))
-    
-    return results
+    chunk_df, compare_cols, skip_norm, decimal_prec = args
+
+    # Use vectorized apply instead of iterrows for better performance
+    def hash_row(row: pd.Series) -> str:
+        return _compute_row_hash(row.tolist(), skip_norm, decimal_prec)
+
+    hashes = chunk_df[compare_cols].apply(hash_row, axis=1)
+    return list(zip(chunk_df.index.tolist(), hashes.tolist()))
 
 
-def compare_rows_parallel(args):
+def compare_rows_parallel(
+    args: Tuple[pd.DataFrame, Dict[str, List[Any]], pd.DataFrame, List[str], List[str], bool, int]
+) -> Tuple[List[Dict[str, Any]], Set[Any]]:
     """
     Compare a chunk of source rows against target using deep comparison.
     Used for parallel processing.
+
+    Args:
+        args: Tuple of (source_chunk, target_key_to_indices, target_df,
+              compare_cols, key_cols, skip_normalisation, decimal_precision)
+
+    Returns:
+        Tuple of (discrepancies list, matched_target_indices set)
     """
-    source_chunk, target_key_to_indices, target_df, compare_cols, key_cols, skip_normalisation = args
-    
-    discrepancies = []
-    matched_target_indices = set()
-    
+    source_chunk, target_key_to_indices, target_df, compare_cols, key_cols, skip_normalisation, decimal_prec = args
+
+    discrepancies: List[Dict[str, Any]] = []
+    matched_target_indices: Set[Any] = set()
+
     for src_idx, src_row in source_chunk.iterrows():
         # Cache normalised values for all columns in source row
-        src_normalised = {col: normalise_value(src_row[col], skip_normalisation) for col in compare_cols}
+        src_normalised = {col: normalise_value(src_row[col], skip_normalisation, numeric_precision=decimal_prec) for col in compare_cols}
         
         # Build composite key using cached values
         src_key = '||'.join([
@@ -628,9 +787,9 @@ def compare_rows_parallel(args):
             if matched_tgt_idx is not None:
                 matched_target_indices.add(matched_tgt_idx)
                 tgt_row = target_df.loc[matched_tgt_idx]
-                
+
                 # Cache normalised values for target row
-                tgt_normalised = {col: normalise_value(tgt_row[col], skip_normalisation) for col in compare_cols}
+                tgt_normalised = {col: normalise_value(tgt_row[col], skip_normalisation, numeric_precision=decimal_prec) for col in compare_cols}
                 
                 differences = []
                 for col in compare_cols:
@@ -693,140 +852,184 @@ def compare_rows_parallel(args):
 
 class HighPerformanceComparator:
     """High-performance CSV comparison engine with parallel processing."""
-    
-    def __init__(self, source_df, target_df, key_columns=None, skip_normalisation=False, num_workers=None):
-        self.source_df = source_df.copy()
-        self.target_df = target_df.copy()
+
+    def __init__(
+        self,
+        source_df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        key_columns: Optional[List[str]] = None,
+        skip_normalisation: bool = False,
+        num_workers: Optional[int] = None,
+        decimal_precision: int = DEFAULT_NUMERIC_PRECISION
+    ) -> None:
+        """
+        Initialise the comparator.
+
+        Args:
+            source_df: Source DataFrame (will not be modified)
+            target_df: Target DataFrame (will not be modified)
+            key_columns: Optional list of key columns for matching
+            skip_normalisation: Whether to skip value normalisation
+            num_workers: Number of parallel workers (defaults to CPU count - 1)
+            decimal_precision: Number of decimal places for numeric comparison (default: 6)
+        """
+        # Use views where possible, only copy when necessary for modifications
+        self.source_df = source_df
+        self.target_df = target_df
         self.key_columns = key_columns
         self.skip_normalisation = skip_normalisation
+        self.decimal_precision = decimal_precision
         self.num_workers = num_workers or max(1, mp.cpu_count() - 1)
-        self.discrepancies = []
-        self.common_columns = []
-        
-        print(f"\nUsing {self.num_workers} CPU cores for parallel processing")
-    
-    def _normalise_dataframe(self, df, label):
-        """Apply normalisation to all values in dataframe using parallel processing for large tables."""
+        self.discrepancies: List[Dict[str, Any]] = []
+        self.common_columns: List[str] = []
+
+        logger.info(f"\nUsing {self.num_workers} CPU cores for parallel processing")
+
+    def _normalise_dataframe(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """
+        Apply normalisation to all values in dataframe using parallel processing for large tables.
+
+        Args:
+            df: DataFrame to normalise
+            label: Display label for logging
+
+        Returns:
+            Normalised DataFrame
+        """
         action = "Skipping normalisation" if self.skip_normalisation else "Normalising"
-        print(f"  {action} for {label} data...")
-        
+        logger.info(f"  {action} for {label} data...")
+
         total_cells = len(df) * len(df.columns)
-        
+        decimal_prec = self.decimal_precision
+
         # For small dataframes, single-threaded is faster (avoids multiprocessing overhead)
         if total_cells < 100_000:
+            df = df.copy()  # Only copy when we need to modify
             for col in df.columns:
-                df[col] = df[col].apply(lambda v: normalise_value(v, self.skip_normalisation))
+                df[col] = df[col].apply(
+                    lambda v: normalise_value(v, self.skip_normalisation, numeric_precision=decimal_prec)
+                )
             return df
-        
+
         # Split into chunks for parallel processing
         num_chunks = self.num_workers * 4  # More chunks than workers for better load balancing
         chunk_size = max(500, len(df) // num_chunks)
         chunks = [df.iloc[i:i+chunk_size].copy() for i in range(0, len(df), chunk_size)]
-        
-        print(f"    Processing {len(chunks)} chunks across {self.num_workers} workers...")
-        
+
+        logger.info(f"    Processing {len(chunks)} chunks across {self.num_workers} workers...")
+
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            args = [(chunk, self.skip_normalisation) for chunk in chunks]
+            args = [(chunk, self.skip_normalisation, decimal_prec) for chunk in chunks]
             results = list(executor.map(normalise_chunk_parallel, args))
-        
+
         # Concatenate results, preserving original indices
         return pd.concat(results)
-    
-    def _align_columns(self):
+
+    def _align_columns(self) -> None:
         """Align columns between dataframes, preserving original order from source."""
         source_cols = set(self.source_df.columns)
         target_cols = set(self.target_df.columns)
-        
+
         common_set = source_cols & target_cols
         self.common_columns = [c for c in self.source_df.columns if c in common_set]
-        
+
         source_only = source_cols - target_cols
         target_only = target_cols - source_cols
-        
+
         if source_only:
-            print(f"  [!] Columns only in source: {', '.join(sorted(source_only))}")
+            logger.info(f"  [!] Columns only in source: {', '.join(sorted(source_only))}")
         if target_only:
-            print(f"  [!] Columns only in target: {', '.join(sorted(target_only))}")
-        
+            logger.info(f"  [!] Columns only in target: {', '.join(sorted(target_only))}")
+
         self.source_df = self.source_df[self.common_columns].copy()
         self.target_df = self.target_df[self.common_columns].copy()
-        
-        print(f"  Common columns for comparison: {len(self.common_columns)}")
-    
-    def _compute_row_hashes(self, df, label):
-        """Compute hash for each row using parallel processing for large tables."""
-        print(f"  Computing hashes for {label}...")
-        
+
+        logger.info(f"  Common columns for comparison: {len(self.common_columns)}")
+
+    def _compute_row_hashes(self, df: pd.DataFrame, label: str) -> pd.DataFrame:
+        """
+        Compute hash for each row using parallel processing for large tables.
+
+        Args:
+            df: DataFrame to hash
+            label: Display label for logging
+
+        Returns:
+            DataFrame with _ROW_HASH_ column added
+        """
+        logger.info(f"  Computing hashes for {label}...")
+
         total_cells = len(df) * len(self.common_columns)
-        
+        skip_norm = self.skip_normalisation
+        decimal_prec = self.decimal_precision
+
         # For small dataframes, single-threaded is faster (avoids multiprocessing overhead)
         if total_cells < 100_000:
-            skip_norm = self.skip_normalisation
-            
-            def hash_row(row):
-                normalised = []
-                for v in row:
-                    norm_v = normalise_value(v, skip_norm)
-                    normalised.append(str(norm_v) if norm_v is not None else 'NULL')
-                return hashlib.md5('|'.join(normalised).encode()).hexdigest()
-            
+            def hash_row(row: pd.Series) -> str:
+                return _compute_row_hash(row.tolist(), skip_norm, decimal_prec)
+
             df = df.copy()
             df['_ROW_HASH_'] = df[self.common_columns].apply(hash_row, axis=1)
             return df
-        
+
         # Split into chunks for parallel processing
         num_chunks = self.num_workers * 4  # More chunks than workers for better load balancing
         chunk_size = max(500, len(df) // num_chunks)
         chunks = [df.iloc[i:i+chunk_size].copy() for i in range(0, len(df), chunk_size)]
-        
-        print(f"    Processing {len(chunks)} chunks across {self.num_workers} workers...")
-        
+
+        logger.info(f"    Processing {len(chunks)} chunks across {self.num_workers} workers...")
+
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            args = [(chunk, list(self.common_columns), self.skip_normalisation) for chunk in chunks]
+            args = [(chunk, list(self.common_columns), skip_norm, decimal_prec) for chunk in chunks]
             results = list(executor.map(compute_hashes_chunk_parallel, args))
-        
+
         # Concatenate results, preserving original indices
         return pd.concat(results)
     
-    def compare(self):
-        """Execute comprehensive comparison."""
-        print("\n" + "=" * 60)
-        print("COMPREHENSIVE COMPARISON")
-        print("=" * 60)
-        
-        print("\nStep 1: Aligning columns...")
+    def compare(self) -> List[Dict[str, Any]]:
+        """
+        Execute comprehensive comparison.
+
+        Returns:
+            List of discrepancy dictionaries
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("COMPREHENSIVE COMPARISON")
+        logger.info("=" * 60)
+
+        logger.info("\nStep 1: Aligning columns...")
         self._align_columns()
-        
-        print("\nStep 2: Normalising data...")
+
+        logger.info("\nStep 2: Normalising data...")
         self.source_df = self._normalise_dataframe(self.source_df, "source")
         self.target_df = self._normalise_dataframe(self.target_df, "target")
-        
-        print("\nStep 3: Computing row hashes...")
+
+        logger.info("\nStep 3: Computing row hashes...")
         self.source_df = self._compute_row_hashes(self.source_df, "source")
         self.target_df = self._compute_row_hashes(self.target_df, "target")
-        
-        print("\nStep 4: Hash-based exact matching...")
-        source_hash_map = defaultdict(list)
-        target_hash_map = defaultdict(list)
-        
+
+        logger.info("\nStep 4: Hash-based exact matching...")
+        source_hash_map: DefaultDict[str, List[Any]] = defaultdict(list)
+        target_hash_map: DefaultDict[str, List[Any]] = defaultdict(list)
+
         for idx, h in self.source_df['_ROW_HASH_'].items():
             source_hash_map[h].append(idx)
         for idx, h in self.target_df['_ROW_HASH_'].items():
             target_hash_map[h].append(idx)
-        
+
         exact_match_hashes = set(source_hash_map.keys()) & set(target_hash_map.keys())
-        
-        source_matched = set()
-        target_matched = set()
-        
+
+        source_matched: Set[Any] = set()
+        target_matched: Set[Any] = set()
+
         for h in exact_match_hashes:
             src_indices = source_hash_map[h]
             tgt_indices = target_hash_map[h]
-            
+
             match_count = min(len(src_indices), len(tgt_indices))
             source_matched.update(src_indices[:match_count])
             target_matched.update(tgt_indices[:match_count])
-            
+
             if len(src_indices) != len(tgt_indices):
                 self.discrepancies.append({
                     'discrepancy_type': 'DUPLICATE_COUNT_MISMATCH',
@@ -835,115 +1038,127 @@ class HighPerformanceComparator:
                     'source_value': f'{len(src_indices)} occurrences',
                     'target_value': f'{len(tgt_indices)} occurrences'
                 })
-        
-        print(f"  [OK] Exact matches: {len(source_matched):,} rows")
-        
+
+        logger.info(f"  [OK] Exact matches: {len(source_matched):,} rows")
+
         source_unmatched_idx = list(set(self.source_df.index) - source_matched)
         target_unmatched_idx = list(set(self.target_df.index) - target_matched)
-        
-        print(f"  Rows to compare further: {len(source_unmatched_idx):,} source, {len(target_unmatched_idx):,} target")
-        
+
+        logger.info(f"  Rows to compare further: {len(source_unmatched_idx):,} source, {len(target_unmatched_idx):,} target")
+
         if not source_unmatched_idx and not target_unmatched_idx:
-            print("\n[OK] All rows matched exactly!")
+            logger.info("\n[OK] All rows matched exactly!")
             return self.discrepancies
-        
-        print("\nStep 5: Deep key-based comparison...")
-        
+
+        logger.info("\nStep 5: Deep key-based comparison...")
+
         source_unmatched = self.source_df.loc[source_unmatched_idx].drop(columns=['_ROW_HASH_']).copy()
         target_unmatched = self.target_df.loc[target_unmatched_idx].drop(columns=['_ROW_HASH_']).copy()
-        
+
         if self.key_columns:
             key_cols = [c.upper() for c in self.key_columns if c.upper() in self.common_columns]
-            print(f"  Using specified key columns: {', '.join(key_cols)}")
+            logger.info(f"  Using specified key columns: {', '.join(key_cols)}")
         else:
-            print("  Auto-detecting composite key columns...")
+            logger.info("  Auto-detecting composite key columns...")
             key_cols = detect_composite_key(source_unmatched)
-        
+
         compare_cols = list(self.common_columns)
-        
-        print("\n  Detecting duplicate rows...")
+
+        logger.info("\n  Detecting duplicate rows...")
         self._detect_duplicates(self.source_df.drop(columns=['_ROW_HASH_']), key_cols, compare_cols, 'SOURCE')
         self._detect_duplicates(self.target_df.drop(columns=['_ROW_HASH_']), key_cols, compare_cols, 'TARGET')
-        
-        print("\n  Building target index...")
-        target_key_to_indices = defaultdict(list)
-        
+
+        logger.info("\n  Building target index...")
+        target_key_to_indices: DefaultDict[str, List[Any]] = defaultdict(list)
+
         for idx, row in target_unmatched.iterrows():
             key = '||'.join([
                 f"{c}={str(row[c]) if row[c] is not None else 'NULL'}"
                 for c in key_cols
             ])
             target_key_to_indices[key].append(idx)
-        
+
         duplicate_keys = {k: v for k, v in target_key_to_indices.items() if len(v) > 1}
         if duplicate_keys:
-            print(f"  [!] Warning: {len(duplicate_keys)} duplicate keys found in unmatched target rows")
-        
-        print("  Running parallel deep comparison...")
+            logger.warning(f"  [!] Warning: {len(duplicate_keys)} duplicate keys found in unmatched target rows")
+
+        logger.info("  Running parallel deep comparison...")
         self._parallel_deep_comparison(source_unmatched, target_unmatched, target_key_to_indices, compare_cols, key_cols)
-        
+
         return self.discrepancies
-    
-    def _detect_duplicates(self, df, key_cols, compare_cols, label):
-        """Detect and report true duplicate rows using full row hash with normalised values."""
+
+    def _detect_duplicates(
+        self,
+        df: pd.DataFrame,
+        key_cols: List[str],
+        compare_cols: List[str],
+        label: str
+    ) -> None:
+        """
+        Detect and report true duplicate rows using full row hash with normalised values.
+
+        Args:
+            df: DataFrame to check for duplicates
+            key_cols: Key columns for composite key display
+            compare_cols: Columns to include in hash
+            label: 'SOURCE' or 'TARGET' for reporting
+        """
         skip_norm = self.skip_normalisation
+        decimal_prec = self.decimal_precision
         total_cells = len(df) * len(compare_cols)
-        
-        hash_to_indices = defaultdict(list)
-        
+
+        hash_to_indices: DefaultDict[str, List[Any]] = defaultdict(list)
+
         # For small dataframes, single-threaded is faster (avoids multiprocessing overhead)
         if total_cells < 100_000:
-            def row_to_hash(row):
-                normalised = []
-                for v in row:
-                    norm_v = normalise_value(v, skip_norm)
-                    normalised.append(str(norm_v) if norm_v is not None else 'NULL')
-                return hashlib.md5('|'.join(normalised).encode()).hexdigest()
-            
-            for idx, row in df.iterrows():
-                row_hash = row_to_hash(row[compare_cols])
+            def row_to_hash(row: pd.Series) -> str:
+                return _compute_row_hash(row.tolist(), skip_norm, decimal_prec)
+
+            # Use vectorized apply instead of iterrows
+            hashes = df[compare_cols].apply(row_to_hash, axis=1)
+            for idx, row_hash in zip(df.index, hashes):
                 hash_to_indices[row_hash].append(idx)
         else:
             # Split into chunks for parallel processing
             num_chunks = self.num_workers * 4
             chunk_size = max(500, len(df) // num_chunks)
             chunks = [df.iloc[i:i+chunk_size].copy() for i in range(0, len(df), chunk_size)]
-            
+
             with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-                args = [(chunk, list(compare_cols), skip_norm) for chunk in chunks]
+                args = [(chunk, list(compare_cols), skip_norm, decimal_prec) for chunk in chunks]
                 results = list(executor.map(detect_duplicates_hash_chunk, args))
-            
+
             # Merge results from all chunks
             for chunk_results in results:
                 for idx, row_hash in chunk_results:
                     hash_to_indices[row_hash].append(idx)
-        
+
         duplicate_hashes = {h: v for h, v in hash_to_indices.items() if len(v) > 1}
-        
+
         if duplicate_hashes:
             total_duplicate_rows = sum(len(v) for v in duplicate_hashes.values())
             unique_duplicates = len(duplicate_hashes)
-            print(f"    {label}: Found {unique_duplicates} unique rows duplicated ({total_duplicate_rows} total duplicate rows)")
-            
+            logger.info(f"    {label}: Found {unique_duplicates} unique rows duplicated ({total_duplicate_rows} total duplicate rows)")
+
             discrepancy_type = f'DUPLICATE_IN_{label}'
-            
+
             for row_hash, indices in duplicate_hashes.items():
                 first_row = df.loc[indices[0]]
-                
+
                 # Cache normalised values to avoid repeated normalisation calls
-                normalised_key_vals = {c: normalise_value(first_row[c], skip_norm) for c in key_cols}
-                normalised_compare_vals = {c: normalise_value(first_row[c], skip_norm) for c in compare_cols}
-                
+                normalised_key_vals = {c: normalise_value(first_row[c], skip_norm, numeric_precision=decimal_prec) for c in key_cols}
+                normalised_compare_vals = {c: normalise_value(first_row[c], skip_norm, numeric_precision=decimal_prec) for c in compare_cols}
+
                 composite_key = '||'.join([
                     f"{c}={str(normalised_key_vals[c]) if normalised_key_vals[c] is not None else 'NULL'}"
                     for c in key_cols
                 ])
-                
+
                 full_row_data = '|'.join([
                     str(normalised_compare_vals[c]) if normalised_compare_vals[c] is not None else 'NULL'
                     for c in compare_cols
                 ])
-                
+
                 self.discrepancies.append({
                     'discrepancy_type': discrepancy_type,
                     'composite_key': composite_key,
@@ -954,44 +1169,60 @@ class HighPerformanceComparator:
                     'full_target_row': full_row_data if label == 'TARGET' else 'N/A'
                 })
         else:
-            print(f"    {label}: No duplicate rows found")
-    
-    def _parallel_deep_comparison(self, source_df, target_df, target_key_to_indices, compare_cols, key_cols):
-        """Perform deep comparison using parallel processing."""
-        all_target_indices = set()
+            logger.info(f"    {label}: No duplicate rows found")
+
+    def _parallel_deep_comparison(
+        self,
+        source_df: pd.DataFrame,
+        target_df: pd.DataFrame,
+        target_key_to_indices: Dict[str, List[Any]],
+        compare_cols: List[str],
+        key_cols: List[str]
+    ) -> None:
+        """
+        Perform deep comparison using parallel processing.
+
+        Args:
+            source_df: Source DataFrame (unmatched rows only)
+            target_df: Target DataFrame (unmatched rows only)
+            target_key_to_indices: Mapping of composite keys to target row indices
+            compare_cols: Columns to compare
+            key_cols: Key columns for composite key
+        """
+        all_target_indices: Set[Any] = set()
         for indices in target_key_to_indices.values():
             all_target_indices.update(indices)
-        
+
         chunk_size = max(500, len(source_df) // (self.num_workers * 8))
         chunks = [source_df.iloc[i:i + chunk_size] for i in range(0, len(source_df), chunk_size)]
-        
-        print(f"  Processing {len(chunks)} chunks with {self.num_workers} workers...")
-        
-        all_matched_target_indices = set()
+
+        logger.info(f"  Processing {len(chunks)} chunks with {self.num_workers} workers...")
+
+        all_matched_target_indices: Set[Any] = set()
         processed = 0
         total_chunks = len(chunks)
-        
+
         target_key_dict = dict(target_key_to_indices)
-        
+
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
             for chunk in chunks:
-                args = (chunk, target_key_dict, target_df, compare_cols, key_cols, self.skip_normalisation)
+                args = (chunk, target_key_dict, target_df, compare_cols, key_cols, self.skip_normalisation, self.decimal_precision)
                 futures.append(executor.submit(compare_rows_parallel, args))
-            
+
             for future in as_completed(futures):
                 chunk_discrepancies, matched_indices = future.result()
                 self.discrepancies.extend(chunk_discrepancies)
                 all_matched_target_indices.update(matched_indices)
                 processed += 1
-                
+
                 if processed % max(1, total_chunks // 10) == 0 or processed == total_chunks:
                     pct = (processed / total_chunks) * 100
-                    print(f"    Progress: {processed}/{total_chunks} chunks ({pct:.0f}%)")
-        
-        print("  Identifying rows only in target...")
+                    logger.info(f"    Progress: {processed}/{total_chunks} chunks ({pct:.0f}%)")
+
+        logger.info("  Identifying rows only in target...")
         unmatched_target_indices = all_target_indices - all_matched_target_indices
-        
+
         for tgt_idx in unmatched_target_indices:
             tgt_row = target_df.loc[tgt_idx]
             key = '||'.join([
@@ -999,7 +1230,7 @@ class HighPerformanceComparator:
                 for c in key_cols
             ])
             full_row_data = '|'.join([
-                str(tgt_row[c]) if tgt_row[c] is not None else 'NULL' 
+                str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'
                 for c in compare_cols
             ])
             self.discrepancies.append({
@@ -1015,54 +1246,65 @@ class HighPerformanceComparator:
         matched_count = len(all_matched_target_indices)
         missing_in_target = len(source_df) - matched_count
         missing_in_source = len(unmatched_target_indices)
-        
-        print(f"\n  Comparison Summary:")
-        print(f"    Rows matched by key: {matched_count:,}")
-        print(f"    Rows only in source: {missing_in_target:,}")
-        print(f"    Rows only in target: {missing_in_source:,}")
+
+        logger.info(f"\n  Comparison Summary:")
+        logger.info(f"    Rows matched by key: {matched_count:,}")
+        logger.info(f"    Rows only in source: {missing_in_target:,}")
+        logger.info(f"    Rows only in target: {missing_in_source:,}")
 
 
-def generate_report(discrepancies, output_file, column_headers=None):
-    """Generate detailed CSV report with column reference."""
-    print("\n" + "=" * 60)
-    print("REPORT GENERATION")
-    print("=" * 60)
-    
+def generate_report(
+    discrepancies: List[Dict[str, Any]],
+    output_file: str,
+    column_headers: Optional[List[str]] = None
+) -> None:
+    """
+    Generate detailed CSV report with column reference.
+
+    Args:
+        discrepancies: List of discrepancy dictionaries
+        output_file: Path to output CSV file
+        column_headers: Optional list of column names for reference file
+    """
+    logger.info("\n" + "=" * 60)
+    logger.info("REPORT GENERATION")
+    logger.info("=" * 60)
+
     if not discrepancies:
-        print("\n[OK] SUCCESS: No discrepancies found!")
+        logger.info("\n[OK] SUCCESS: No discrepancies found!")
         df = pd.DataFrame(columns=[
-            'discrepancy_type', 'composite_key', 'column_name', 
+            'discrepancy_type', 'composite_key', 'column_name',
             'source_value', 'target_value', 'full_source_row', 'full_target_row'
         ])
         df.to_csv(output_file, index=False)
-        print(f"\n[OK] Empty report saved to: {output_file}")
+        logger.info(f"\n[OK] Empty report saved to: {output_file}")
         return
-    
+
     df = pd.DataFrame(discrepancies)
-    
+
     col_order = [
-        'discrepancy_type', 'composite_key', 'column_name', 
+        'discrepancy_type', 'composite_key', 'column_name',
         'source_value', 'target_value', 'full_source_row', 'full_target_row'
     ]
     df = df[[c for c in col_order if c in df.columns]]
     df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
-    
+
     df.to_csv(output_file, index=False)
-    
-    print(f"\n[X] DISCREPANCIES FOUND: {len(discrepancies):,}")
-    print("\nBreakdown by type:")
+
+    logger.info(f"\n[X] DISCREPANCIES FOUND: {len(discrepancies):,}")
+    logger.info("\nBreakdown by type:")
     for dtype, count in df['discrepancy_type'].value_counts().items():
-        print(f"  {dtype}: {count:,}")
-    
+        logger.info(f"  {dtype}: {count:,}")
+
     if 'VALUE_MISMATCH' in df['discrepancy_type'].values:
         mismatch_df = df[df['discrepancy_type'] == 'VALUE_MISMATCH']
-        print(f"\nValue mismatches by column (top 10):")
+        logger.info(f"\nValue mismatches by column (top 10):")
         col_counts = mismatch_df['column_name'].value_counts().head(10)
         for col, count in col_counts.items():
-            print(f"  {col}: {count:,}")
-    
-    print(f"\n[OK] Report saved to: {output_file}")
-    
+            logger.info(f"  {col}: {count:,}")
+
+    logger.info(f"\n[OK] Report saved to: {output_file}")
+
     if column_headers:
         ref_file = output_file.replace('.csv', '_column_reference.txt')
         with open(ref_file, 'w') as f:
@@ -1075,77 +1317,96 @@ def generate_report(discrepancies, output_file, column_headers=None):
             for i, col in enumerate(column_headers):
                 f.write(f"  {i+1}. {col}\n")
             f.write(f"\nTotal columns: {len(column_headers)}\n")
-        print(f"[OK] Column reference saved to: {ref_file}")
-    
-    print("\nSample discrepancies (first 5):")
+        logger.info(f"[OK] Column reference saved to: {ref_file}")
+
+    logger.info("\nSample discrepancies (first 5):")
     sample_df = df.head(5).copy()
     for col in ['source_value', 'target_value']:
         sample_df[col] = sample_df[col].apply(lambda x: x[:50] + '...' if len(str(x)) > 50 else x)
-    print(sample_df.to_string(index=False))
+    logger.info(sample_df.to_string(index=False))
 
 
-def parse_arguments():
-    """Parse command line arguments."""
+def parse_arguments() -> argparse.Namespace:
+    """
+    Parse command line arguments.
+
+    Returns:
+        Parsed argument namespace
+    """
     parser = argparse.ArgumentParser(
         description="CSV Comparator - High-Performance Migration Validation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Key columns are optional - auto-detected if not provided."
     )
-    
+
     parser.add_argument("source_csv", nargs="?", help="Path to the source (Hive) CSV file")
     parser.add_argument("target_csv", nargs="?", help="Path to the target (Snowflake) CSV file")
     parser.add_argument("key_columns", nargs="*", help="Optional key columns for comparison")
     parser.add_argument("--output-dir", dest="output_dir", help="Directory to save the discrepancy report")
     parser.add_argument("--no-normalisation", dest="no_normalisation", action="store_true", default=False,
                         help="Disable value normalisation (nulls, booleans, timestamps, numbers)")
-    
+    parser.add_argument("--decimal-precision", dest="decimal_precision", type=int, default=6,
+                        help="Number of decimal places for numeric comparison (default: 6)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable verbose/debug logging")
+
     return parser.parse_args()
 
 
-def main():
-    print("=" * 70)
-    print("CSV Comparator - High-Performance Migration Validation")
-    print("Hive to Snowflake Data Comparison")
-    print("=" * 70)
-    
+def main() -> None:
+    """Main entry point for the CSV comparator."""
     args = parse_arguments()
-    
+
+    # Configure logging level based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    logger.info("=" * 70)
+    logger.info("CSV Comparator - High-Performance Migration Validation")
+    logger.info("Hive to Snowflake Data Comparison")
+    logger.info("=" * 70)
+
     if args.source_csv and args.target_csv:
         source_file = args.source_csv
         target_file = args.target_csv
         key_columns = args.key_columns if args.key_columns else None
         output_dir = args.output_dir
         skip_normalisation = args.no_normalisation
+        decimal_precision = args.decimal_precision
     else:
-        print("\nUsage: python csv_comparator.py <source_csv> <target_csv> [key_col1 key_col2 ...] [--output-dir DIR] [--no-normalisation]")
-        print("\nKey columns are optional - auto-detected if not provided.")
+        logger.info("\nUsage: python csv_comparator.py <source_csv> <target_csv> [key_col1 key_col2 ...] [--output-dir DIR] [--no-normalisation] [--decimal-precision N]")
+        logger.info("\nKey columns are optional - auto-detected if not provided.")
         source_file = input("Source (Hive) CSV path: ").strip()
         target_file = input("Target (Snowflake) CSV path: ").strip()
         key_input = input("Key columns (comma-separated, or Enter for auto): ").strip()
         key_columns = [c.strip() for c in key_input.split(',')] if key_input else None
         output_dir = None
         skip_normalisation = False
-    
+        decimal_precision = DEFAULT_NUMERIC_PRECISION
+
     for path, name in [(source_file, "Source"), (target_file, "Target")]:
         if not os.path.exists(path):
-            print(f"\n[X] Error: {name} file not found: {path}")
+            logger.error(f"\n[X] Error: {name} file not found: {path}")
             sys.exit(1)
-    
-    print(f"\nSource: {source_file}")
-    print(f"Target: {target_file}")
-    print(f"Keys: {', '.join(key_columns) if key_columns else 'Auto-detect'}")
+
+    logger.info(f"\nSource: {source_file}")
+    logger.info(f"Target: {target_file}")
+    logger.info(f"Keys: {', '.join(key_columns) if key_columns else 'Auto-detect'}")
     if output_dir:
-        print(f"Output directory: {output_dir}")
-    print(f"Normalisation: {'Disabled' if skip_normalisation else 'Enabled'}")
-    
-    print("\n" + "-" * 40)
-    print("Loading files...")
+        logger.info(f"Output directory: {output_dir}")
+    logger.info(f"Normalisation: {'Disabled' if skip_normalisation else 'Enabled'}")
+    logger.info(f"Decimal precision: {decimal_precision}")
+
+    logger.info("\n" + "-" * 40)
+    logger.info("Loading files...")
     source_df = load_csv_file(source_file, "Source (Hive)")
     target_df = load_csv_file(target_file, "Target (Snowflake)")
-    
-    comparator = HighPerformanceComparator(source_df, target_df, key_columns, skip_normalisation)
+
+    comparator = HighPerformanceComparator(
+        source_df, target_df, key_columns, skip_normalisation, decimal_precision=decimal_precision
+    )
     discrepancies = comparator.compare()
-    
+
     source_basename = os.path.basename(source_file)
     name_without_ext = os.path.splitext(source_basename)[0]
     parts = name_without_ext.rsplit('_', 2)
@@ -1153,21 +1414,21 @@ def main():
         table_name = '_'.join(parts[:-2])
     else:
         table_name = name_without_ext
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_filename = f"{table_name}_discrepancy_report_{timestamp}.csv"
-    
+
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, output_filename)
     else:
         output_file = output_filename
-    
+
     generate_report(discrepancies, output_file, comparator.common_columns)
-    
-    print("\n" + "=" * 70)
-    print("Comparison Complete!")
-    print("=" * 70)
+
+    logger.info("\n" + "=" * 70)
+    logger.info("Comparison Complete!")
+    logger.info("=" * 70)
 
 
 if __name__ == "__main__":
