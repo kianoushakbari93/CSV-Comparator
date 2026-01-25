@@ -1285,21 +1285,21 @@ def run_performance_tests(comparator_path, num_rows=10000):
         start = time.time()
         result = run_comparator(comparator_path, source_path, target_path)
         elapsed = time.time() - start
-        
-        success = check_success(result.stdout)
-        
+
+        success = check_success(result.stdout, result.stderr)
+
         if success:
             print(f"    [OK] All {num_rows:,} rows matched")
         else:
             print(f"    [X] Comparison failed")
             all_passed = False
-        
+
         print(f"    Time:  Execution time: {elapsed:.2f} seconds")
         print(f"    Stats: Throughput: {num_rows / elapsed:,.0f} rows/second")
-        
+
         # Test 2: Large dataset with some discrepancies
         print("\n  Test 2: Large dataset with discrepancies...")
-        
+
         # Introduce some differences
         rows_modified = rows_target.copy()
         num_changes = min(100, num_rows // 100)
@@ -1308,15 +1308,15 @@ def run_performance_tests(comparator_path, num_rows=10000):
             parts = rows_modified[idx].split('|')
             parts[2] = str(int(parts[2]) + 1)  # Change value
             rows_modified[idx] = '|'.join(parts)
-        
+
         target_content_modified = header + "\n" + "\n".join(rows_modified)
         target_path_modified = create_test_file(temp_dir, "perf_target_mod", target_content_modified)
-        
+
         start = time.time()
         result = run_comparator(comparator_path, source_path, target_path_modified)
         elapsed = time.time() - start
-        
-        discrepancies = count_discrepancies(result.stdout)
+
+        discrepancies = count_discrepancies(result.stdout, result.stderr)
         
         # Each changed row with key match appears as 1 VALUE_MISMATCH
         expected_discrepancies = num_changes
@@ -1349,20 +1349,20 @@ def run_performance_tests(comparator_path, num_rows=10000):
         start = time.time()
         result = run_comparator(comparator_path, source_path_wide, target_path_wide)
         elapsed = time.time() - start
-        
-        success = check_success(result.stdout)
-        
+
+        success = check_success(result.stdout, result.stderr)
+
         if success:
             print(f"    [OK] All 1,000 rows x 50 columns matched")
         else:
             print(f"    [X] Comparison failed")
             all_passed = False
-        
+
         print(f"    Time:  Execution time: {elapsed:.2f} seconds")
-        
+
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-    
+
     return all_passed
 
 
