@@ -22,16 +22,8 @@ import subprocess
 import argparse
 import time
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from io import StringIO
-
-# Try pytest, fall back to basic runner
-try:
-    import pytest
-    HAS_PYTEST = True
-except ImportError:
-    HAS_PYTEST = False
 
 import pandas as pd
 
@@ -880,12 +872,6 @@ def get_comparator_module(comparator_path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def get_normalise_function(comparator_path):
-    """Import normalise_value from the comparator script."""
-    module = get_comparator_module(comparator_path)
-    return module.normalise_value
 
 
 def create_test_file(temp_dir, name, content):

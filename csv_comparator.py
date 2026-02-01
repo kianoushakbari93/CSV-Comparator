@@ -13,7 +13,6 @@ Features:
 from __future__ import annotations
 
 import pandas as pd
-import numpy as np
 import sys
 import re
 import os
@@ -567,7 +566,7 @@ def expand_row_text_column(df: pd.DataFrame) -> pd.DataFrame:
     num_cols = len(first_valid.split(internal_delim))
     col_names = [f'COL_{i+1}' for i in range(num_cols)]
 
-    # Use vectorized string split instead of iterrows
+    # Use vectorised string split instead of iterrows
     def split_and_pad(val: Any) -> List[str]:
         if pd.notna(val) and val:
             parts = str(val).split(internal_delim)
@@ -868,7 +867,7 @@ def detect_duplicates_hash_chunk(
     """
     chunk_df, compare_cols, skip_norm, decimal_prec = args
 
-    # Use vectorized apply instead of iterrows for better performance
+    # Use vectorised apply instead of iterrows for better performance
     def hash_row(row: pd.Series) -> str:
         return _compute_row_hash(row.tolist(), skip_norm, decimal_prec)
 
@@ -1331,7 +1330,7 @@ class HighPerformanceComparator:
             def row_to_hash(row: pd.Series) -> str:
                 return _compute_row_hash(row.tolist(), skip_norm, decimal_prec)
 
-            # Use vectorized apply instead of iterrows
+            # Use vectorised apply instead of iterrows
             hashes = df[compare_cols].apply(row_to_hash, axis=1)
             for idx, row_hash in zip(df.index, hashes):
                 hash_to_indices[row_hash].append(idx)
@@ -1489,28 +1488,6 @@ def _write_chunk_to_csv(args: Tuple[pd.DataFrame, str, bool]) -> str:
     with os.fdopen(temp_fd, 'w', encoding='utf-8', newline='') as f:
         chunk_df.to_csv(f, index=False, header=include_header)
     return temp_path
-
-
-def _compute_stats_chunk(args: Tuple[pd.DataFrame, str]) -> Dict[str, Any]:
-    """
-    Compute statistics for a chunk of the report DataFrame.
-    
-    Args:
-        args: Tuple of (chunk_df, stat_type)
-    
-    Returns:
-        Dictionary with statistics
-    """
-    chunk_df, stat_type = args
-    
-    if stat_type == 'type_counts':
-        return {'type_counts': chunk_df['discrepancy_type'].value_counts().to_dict()}
-    elif stat_type == 'column_counts':
-        mismatch_df = chunk_df[chunk_df['discrepancy_type'] == 'VALUE_MISMATCH']
-        if len(mismatch_df) > 0:
-            return {'column_counts': mismatch_df['column_name'].value_counts().to_dict()}
-        return {'column_counts': {}}
-    return {}
 
 
 def generate_report(
