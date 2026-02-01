@@ -8,9 +8,11 @@ High-performance CSV comparison tool for Hive to Snowflake data migration valida
 
 - **Intelligent delimiter detection** - Automatically detects pipe, comma, tab, and other delimiters
 - **Value normalisation** - Handles differences in timestamps, booleans, nulls, and numeric formats
-- **Composite key detection** - Automatically identifies optimal key columns for matching
+- **Composite key detection** - Automatically identifies optimal key columns for matching (up to 30 columns)
+- **Fuzzy key matching** - Matches rows with similar keys (slashes, pipes, whitespace, numeric tolerance)
 - **Duplicate detection** - Reports duplicate rows in source and target files
 - **Parallel processing** - Uses multiprocessing for large datasets (100k+ cells)
+- **Configurable escape character** - Optional escape character for CSV parsing
 - **Detailed reporting** - Generates CSV reports with full row context
 
 ---
@@ -52,13 +54,16 @@ python csv_comparator.py source.csv target.csv ID TRADE_DATE ACCOUNT_ID
 
 ### Command Line Options
 
-- `source_csv` - Path to the source (Hive) CSV file
-- `target_csv` - Path to the target (Snowflake) CSV file
-- `key_columns` - Optional: Space-separated list of key columns
-- `--output-dir DIR` - Directory to save the discrepancy report
-- `--no-normalisation` - Disable value normalisation
-- `--decimal-precision N` - Number of decimal places for numeric comparison (default: 6)
-- `-v, --verbose` - Enable verbose/debug logging
+| Option | Description |
+|--------|-------------|
+| `source_csv` | Path to the source (Hive) CSV file |
+| `target_csv` | Path to the target (Snowflake) CSV file |
+| `key_columns` | Optional: Space-separated list of key columns |
+| `--output-dir DIR` | Directory to save the discrepancy report |
+| `--no-normalisation` | Disable value normalisation |
+| `--decimal-precision N` | Number of decimal places for numeric comparison (default: 6) |
+| `--esc-char CHAR` | Escape character for CSV parsing (default: None) |
+| `-v, --verbose` | Enable verbose/debug logging |
 
 ### Examples
 
@@ -80,6 +85,12 @@ python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precisio
 
 # Use 2 decimal places for currency values
 python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precision 2
+
+# Use backslash as escape character (for Hive exports with backslash escaping)
+python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\\"
+
+# Use tilde as escape character
+python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "~"
 ```
 
 ### Interactive Mode
@@ -124,6 +135,85 @@ Use `--no-normalisation` to disable this behaviour for strict byte-for-byte comp
 
 ---
 
+## Fuzzy Key Matching
+
+When exact key matching fails, the comparator attempts fuzzy key matching to find similar rows. This helps identify rows that should match but have minor formatting differences in key columns.
+
+### Fuzzy Matching Rules
+
+**For String Values:**
+| Source | Target | Match? | Reason |
+|--------|--------|--------|--------|
+| `UPAM/9741/2265` | `UPAM 9741 2265` | ✓ | Slashes replaced with spaces |
+| `ABC\|DEF` | `ABC DEF` | ✓ | Pipes replaced with spaces |
+| `ABC\\DEF` | `ABC DEF` | ✓ | Backslashes replaced with spaces |
+| `ABC_DEF_123` | `ABCDEF123` | ✓ | Underscores removed |
+| `ABC-DEF-123` | `ABCDEF123` | ✓ | Dashes removed |
+| `ABC.DEF.123` | `ABCDEF123` | ✓ | Dots removed |
+| `ABC(DEF)123` | `ABCDEF123` | ✓ | Parentheses removed |
+| `ABC  DEF` | `ABC DEF` | ✓ | Multiple spaces collapsed |
+| `abc/def` | `ABC DEF` | ✓ | Case-insensitive |
+
+**For Numeric Values:**
+| Source | Target | Match? | Reason |
+|--------|--------|--------|--------|
+| `156999` | `157050` | ✓ | Within 100 absolute tolerance |
+| `1000000` | `1005000` | ✓ | Within 1% relative tolerance |
+| `100` | `300` | ✗ | Outside tolerance |
+
+### Fuzzy Match Reporting
+
+When rows are matched via fuzzy matching:
+- Key column differences are reported as `KEY_VALUE_MISMATCH`
+- The composite key shows both keys: `source_key ~> target_key`
+- Non-key column differences are still reported as `VALUE_MISMATCH`
+
+---
+
+## Escape Character Option
+
+The `--esc-char` option allows you to specify an escape character for CSV parsing. This is useful when:
+
+- Hive exports use backslash escaping (`\|`, `\n`, `\"`)
+- CSV files contain special characters that need escaping
+- Different systems use different escape conventions
+
+**Default behaviour:** No escape character (None)
+
+```bash
+# For Hive exports with backslash escaping
+python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\\"
+
+# For files using tilde as escape character
+python csv_comparator.py source.csv target.csv --esc-char "~"
+```
+
+**Note:** Only single-character escape values are supported.
+
+---
+
+## Composite Key Detection
+
+The comparator automatically detects optimal composite keys for large tables:
+
+- **Maximum columns evaluated:** 30
+- **Search range:** Up to 25 columns in combinations
+- **Fallback:** Uses top 20 candidate columns if no unique combination found
+- **Target uniqueness:** 99.9% (falls back if not achievable)
+
+Key column candidates are ranked by:
+1. Integer columns (likely IDs)
+2. Alphabetic code columns
+3. Alphanumeric columns
+4. Columns with high cardinality
+
+Columns excluded from key detection:
+- Timestamp/date columns
+- Columns with patterns like `_RATIO`, `_AMOUNT`, `_VALUE`, etc.
+- Columns named `DESCRIPTION`, `COMMENT`, `NOTE`, etc.
+
+---
+
 ## Output
 
 ### Console Output
@@ -132,7 +222,9 @@ The tool displays:
 
 - File loading status
 - Delimiter detection results
+- Escape character setting
 - Key column selection
+- Composite key uniqueness percentage
 - Comparison progress
 - Summary of matches and discrepancies
 
@@ -140,18 +232,27 @@ The tool displays:
 
 A CSV report is generated with the following columns:
 
-- `discrepancy_type` - Type of discrepancy:
-  - `VALUE_MISMATCH` - Values differ between source and target
-  - `MISSING_IN_SOURCE` - Row exists in target but not in source
-  - `MISSING_IN_TARGET` - Row exists in source but not in target
-  - `DUPLICATE_IN_SOURCE` - Duplicate row found in source
-  - `DUPLICATE_IN_TARGET` - Duplicate row found in target
-- `composite_key` - The key values identifying the row
-- `column_name` - Column where mismatch occurred
-- `source_value` - Value in source file
-- `target_value` - Value in target file
-- `full_source_row` - Complete source row (pipe-delimited)
-- `full_target_row` - Complete target row (pipe-delimited)
+| Column | Description |
+|--------|-------------|
+| `discrepancy_type` | Type of discrepancy (see below) |
+| `composite_key` | The key values identifying the row |
+| `column_name` | Column where mismatch occurred |
+| `source_value` | Value in source file |
+| `target_value` | Value in target file |
+| `full_source_row` | Complete source row (pipe-delimited) |
+| `full_target_row` | Complete target row (pipe-delimited) |
+
+### Discrepancy Types
+
+| Type | Description |
+|------|-------------|
+| `VALUE_MISMATCH` | Values differ between source and target (non-key columns) |
+| `KEY_VALUE_MISMATCH` | Key column values differ (fuzzy matched rows) |
+| `MISSING_IN_SOURCE` | Row exists in target but not in source |
+| `MISSING_IN_TARGET` | Row exists in source but not in target |
+| `DUPLICATE_IN_SOURCE` | Duplicate row found in source |
+| `DUPLICATE_IN_TARGET` | Duplicate row found in target |
+| `DUPLICATE_COUNT_MISMATCH` | Different number of identical rows in source vs target |
 
 ### Column Reference File
 
@@ -192,12 +293,14 @@ python csv_comparator_tests.py --skip-unit --skip-integration --skip-performance
 
 ### Test Options
 
-- `--skip-unit` - Skip unit tests
-- `--skip-integration` - Skip integration tests
-- `--skip-performance` - Skip performance tests
-- `--skip-error` - Skip error handling tests
-- `--performance-rows N` - Number of rows for performance test (default: 10000)
-- `-c PATH` - Path to csv_comparator.py if not in same directory
+| Option | Description |
+|--------|-------------|
+| `--skip-unit` | Skip unit tests |
+| `--skip-integration` | Skip integration tests |
+| `--skip-performance` | Skip performance tests |
+| `--skip-error` | Skip error handling tests |
+| `--performance-rows N` | Number of rows for performance test (default: 10000) |
+| `-c PATH` | Path to csv_comparator.py if not in same directory |
 
 ### Examples
 
@@ -227,38 +330,48 @@ pytest csv_comparator_tests.py -v -k "unit"
 
 The test suite includes:
 
-- **Unit Tests (96 tests)** - Tests individual functions
-- **Integration Tests (30 tests)** - End-to-end CSV comparison tests
+- **Unit Tests (130+ tests)** - Tests individual functions
+- **Integration Tests (38 tests)** - End-to-end CSV comparison tests
 - **Performance Tests (3 tests)** - Large dataset benchmarks
 - **Error Handling (4 tests)** - Edge cases and error conditions
 
 ### Unit Tests Cover
 
-- `normalise_value()` - Value normalisation
-- `detect_delimiter_for_line()` - Single line delimiter detection
-- `detect_delimiters()` - File delimiter detection
-- `preprocess_quoted_rows()` - Quoted row handling
-- `expand_row_text_column()` - Row text expansion
-- `detect_composite_key()` - Key column detection
-- `generate_report()` - Report generation
-- `HighPerformanceComparator` - Main comparison class
-- `cleaned_csv()` - Context manager
-- `load_mixed_delimiter_csv()` - Mixed delimiter handling
-- Parallel processing functions
+| Function | Tests |
+|----------|-------|
+| `normalise_value()` | 58 tests - Value normalisation |
+| `detect_delimiter_for_line()` | 9 tests - Single line delimiter detection |
+| `detect_delimiters()` | 5 tests - File delimiter detection |
+| `preprocess_quoted_rows()` | 4 tests - Quoted row handling |
+| `expand_row_text_column()` | 4 tests - Row text expansion |
+| `detect_composite_key()` | 3 tests - Key column detection |
+| `generate_report()` | 3 tests - Report generation |
+| `HighPerformanceComparator` | 3 tests - Main comparison class |
+| `cleaned_csv()` | 2 tests - Context manager |
+| `load_mixed_delimiter_csv()` | 2 tests - Mixed delimiter handling |
+| `normalise_key_for_fuzzy()` | 16 tests - Fuzzy key normalisation |
+| `key_values_fuzzy_equal()` | 16 tests - Fuzzy value comparison |
+| `build_fuzzy_key()` | 2 tests - Fuzzy key building |
+| Parallel processing functions | 3 tests |
 
 ### Integration Tests Cover
 
-- Timestamp normalisation
-- Boolean normalisation
-- Null value handling
-- Numeric formatting
-- Column name case sensitivity
-- Duplicate row handling
-- Missing row detection
-- Value mismatch detection
-- Multiple delimiter types
-- Unicode characters
-- Edge cases (empty files, single row, single column)
+| Category | Tests |
+|----------|-------|
+| Timestamp normalisation | 3 tests |
+| Boolean normalisation | 2 tests |
+| Null value handling | 1 test |
+| Numeric formatting | 4 tests |
+| Column name case sensitivity | 1 test |
+| Duplicate row handling | 2 tests |
+| Missing row detection | 1 test |
+| Value mismatch detection | 1 test |
+| Multiple delimiter types | 2 tests |
+| Special characters | 1 test |
+| Unicode characters | 1 test |
+| Edge cases | 4 tests |
+| Escape character handling | 2 tests |
+| Fuzzy key matching | 6 tests |
 
 ---
 
@@ -279,6 +392,39 @@ For very large files (millions of rows), consider:
 - Increasing available RAM
 - Processing in batches
 - Using the `--no-normalisation` flag to reduce memory usage
+
+### Escape Character Errors
+
+If you see `Only length-1 escapes supported`, ensure you're passing a single character to `--esc-char`:
+
+```bash
+# Correct
+python csv_comparator.py source.csv target.csv --esc-char "\\"
+
+# Incorrect (double escaped)
+python csv_comparator.py source.csv target.csv --esc-char "\\\\"
+```
+
+### High Missing Row Counts
+
+If you see many `MISSING_IN_SOURCE` and `MISSING_IN_TARGET` discrepancies:
+
+1. **Check if source and target have overlapping data** - The files may contain different date ranges or subsets
+2. **Review composite key selection** - The auto-detected keys may not be optimal; try specifying keys manually
+3. **Enable verbose mode** - Use `-v` to see key column selection details
+4. **Check fuzzy matching** - Rows with similar but not identical keys will be fuzzy-matched and reported as `KEY_VALUE_MISMATCH`
+
+---
+
+## Changelog
+
+### Latest Version
+
+- Added `--esc-char` option for configurable escape character (default: None)
+- Added fuzzy key matching for rows with similar keys
+- Added `KEY_VALUE_MISMATCH` discrepancy type for fuzzy-matched rows
+- Increased composite key limits: max 30 columns, search up to 25 combinations, fallback to 20
+- Improved test coverage with 38 integration tests and 130+ unit tests
 
 ---
 

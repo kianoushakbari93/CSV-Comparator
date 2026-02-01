@@ -157,6 +157,134 @@ def normalise_value(
     return str_value
 
 
+def normalise_key_for_fuzzy(value: Any) -> str:
+    """
+    Normalise a key value for fuzzy matching.
+    Removes/normalises slashes, pipes, extra whitespace, and special characters.
+
+    Args:
+        value: The value to normalise
+
+    Returns:
+        Normalised string for fuzzy comparison
+    """
+    if pd.isna(value) or value is None:
+        return 'NULL'
+
+    str_value = str(value).strip()
+    if str_value.lower() in ['', 'null', 'none', 'nan', 'nat', 'n/a', 'na', '<null>']:
+        return 'NULL'
+
+    # Replace slashes, pipes, backslashes with space
+    normalised = re.sub(r'[/|\\]', ' ', str_value)
+    # Collapse multiple whitespace to single space
+    normalised = re.sub(r'\s+', ' ', normalised)
+    # Remove common special characters that might differ
+    normalised = re.sub(r'[_\-\.\(\)\[\]\{\}]', '', normalised)
+    # Uppercase for case-insensitive comparison
+    normalised = normalised.strip().upper()
+
+    return normalised
+
+
+def key_values_fuzzy_equal(
+    src_val: Any,
+    tgt_val: Any,
+    skip_normalisation: bool = False,
+    numeric_precision: int = DEFAULT_NUMERIC_PRECISION,
+    numeric_tolerance: float = 100.0,
+    numeric_tolerance_pct: float = 0.01
+) -> Tuple[bool, str]:
+    """
+    Check if two key values are similar enough for fuzzy matching.
+
+    For strings: normalise (slashes, pipes, whitespace, special chars) and compare
+    For numbers: check if within tolerance (absolute or percentage)
+
+    Args:
+        src_val: Source value
+        tgt_val: Target value
+        skip_normalisation: Whether to skip value normalisation
+        numeric_precision: Decimal precision for numeric comparison
+        numeric_tolerance: Absolute tolerance for numeric differences (default: 100)
+        numeric_tolerance_pct: Percentage tolerance for numeric differences (default: 1%)
+
+    Returns:
+        Tuple of (is_similar: bool, reason: str)
+        reason is 'EXACT', 'FUZZY_STRING', 'FUZZY_NUMERIC', or 'DIFFERENT'
+    """
+    # First normalise both values
+    src_norm = normalise_value(src_val, skip_normalisation, numeric_precision=numeric_precision)
+    tgt_norm = normalise_value(tgt_val, skip_normalisation, numeric_precision=numeric_precision)
+
+    # Exact match after normalisation
+    if src_norm == tgt_norm:
+        return True, 'EXACT'
+
+    # Handle NULL cases
+    if src_norm is None and tgt_norm is None:
+        return True, 'EXACT'
+    if src_norm is None or tgt_norm is None:
+        return False, 'DIFFERENT'
+
+    # Try numeric comparison with tolerance
+    try:
+        src_num = float(str(src_norm).replace(',', ''))
+        tgt_num = float(str(tgt_norm).replace(',', ''))
+
+        diff = abs(src_num - tgt_num)
+        max_val = max(abs(src_num), abs(tgt_num), 1.0)
+
+        # Similar if within absolute tolerance OR percentage tolerance
+        if diff <= numeric_tolerance or (diff / max_val) <= numeric_tolerance_pct:
+            return True, 'FUZZY_NUMERIC'
+        return False, 'DIFFERENT'
+    except (ValueError, TypeError):
+        pass
+
+    # Fuzzy string comparison
+    src_fuzzy = normalise_key_for_fuzzy(src_norm)
+    tgt_fuzzy = normalise_key_for_fuzzy(tgt_norm)
+
+    if src_fuzzy == tgt_fuzzy:
+        return True, 'FUZZY_STRING'
+
+    # Check if one string contains the other (for extra character cases)
+    if len(src_fuzzy) > 0 and len(tgt_fuzzy) > 0:
+        # Allow up to 2 character difference for small strings, more for longer ones
+        max_diff = max(2, min(len(src_fuzzy), len(tgt_fuzzy)) // 10)
+        if abs(len(src_fuzzy) - len(tgt_fuzzy)) <= max_diff:
+            # Simple character-level similarity check
+            longer = src_fuzzy if len(src_fuzzy) >= len(tgt_fuzzy) else tgt_fuzzy
+            shorter = tgt_fuzzy if len(src_fuzzy) >= len(tgt_fuzzy) else src_fuzzy
+            if shorter in longer:
+                return True, 'FUZZY_STRING'
+
+    return False, 'DIFFERENT'
+
+
+def build_fuzzy_key(row: pd.Series, key_cols: List[str]) -> str:
+    """
+    Build a normalised fuzzy key for indexing.
+    Uses first 3 key columns for the index lookup.
+
+    Args:
+        row: DataFrame row
+        key_cols: List of key column names
+
+    Returns:
+        Fuzzy key string for index lookup
+    """
+    # Use first 3 key columns for fuzzy index (balance between specificity and flexibility)
+    index_cols = key_cols[:3]
+    parts = []
+    for c in index_cols:
+        val = row[c] if c in row.index else None
+        fuzzy_val = normalise_key_for_fuzzy(val)
+        parts.append(f"{c}={fuzzy_val}")
+    return '||'.join(parts)
+
+
 def detect_delimiter_for_line(line: str) -> str:
     """Detect the most likely delimiter for a single line."""
     delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
@@ -291,13 +419,14 @@ def cleaned_csv(filepath: str):
                 logger.debug(f"Failed to clean up temp file {cleaned_path}: {e}")
 
 
-def load_csv_file(filepath: str, source_name: str) -> pd.DataFrame:
+def load_csv_file(filepath: str, source_name: str, escape_char: Optional[str] = None) -> pd.DataFrame:
     """
     Load CSV with automatic delimiter detection and row_text handling.
 
     Args:
         filepath: Path to the CSV file
         source_name: Display name for logging
+        escape_char: Optional escape character for CSV parsing (default: None)
 
     Returns:
         Loaded DataFrame with normalised column names
@@ -334,7 +463,8 @@ def load_csv_file(filepath: str, source_name: str) -> pd.DataFrame:
                     skipinitialspace=True,
                     on_bad_lines='warn',
                     engine='c',
-                    low_memory=False
+                    low_memory=False,
+                    escapechar=escape_char
                 )
 
             df.columns = df.columns.str.strip().str.upper()
@@ -455,7 +585,7 @@ def expand_row_text_column(df: pd.DataFrame) -> pd.DataFrame:
 
 def detect_composite_key(
     df: pd.DataFrame,
-    max_columns: int = 10,
+    max_columns: int = 30,
     exclusion_patterns: Optional[List[str]] = None
 ) -> List[str]:
     """
@@ -482,7 +612,7 @@ def detect_composite_key(
         List of column names forming the composite key
     """
     if len(df) == 0:
-        return list(df.columns)[:3]
+        return list(df.columns)[:20]
 
     total_columns = len(df.columns)
     logger.info(f"  Total columns: {total_columns}")
@@ -633,7 +763,7 @@ def detect_composite_key(
             break
     
     if not unique_cols:
-        for i in range(1, min(len(candidate_cols) + 1, 6)):
+        for i in range(1, min(len(candidate_cols) + 1, 25)):
             combo = candidate_cols[:i]
             combined = df[combo].apply(lambda row: '||'.join(str(v) for v in row), axis=1)
             unique_ratio = combined.nunique() / len(df)
@@ -643,7 +773,7 @@ def detect_composite_key(
                 break
     
     if not unique_cols:
-        unique_cols = candidate_cols[:3] if candidate_cols else list(df.columns)[:3]
+        unique_cols = candidate_cols[:20] if candidate_cols else list(df.columns)[:20]
     
     result = list(unique_cols)
     
@@ -747,20 +877,22 @@ def detect_duplicates_hash_chunk(
 
 
 def compare_rows_parallel(
-    args: Tuple[pd.DataFrame, Dict[str, List[Any]], pd.DataFrame, List[str], List[str], bool, int]
+    args: Tuple[pd.DataFrame, Dict[str, List[Any]], Dict[str, List[Any]], pd.DataFrame, List[str], List[str], bool, int]
 ) -> Tuple[List[Dict[str, Any]], Set[Any]]:
     """
     Compare a chunk of source rows against target using deep comparison.
+    Supports both exact and fuzzy key matching.
     Used for parallel processing.
 
     Args:
-        args: Tuple of (source_chunk, target_key_to_indices, target_df,
-              compare_cols, key_cols, skip_normalisation, decimal_precision)
+        args: Tuple of (source_chunk, target_key_to_indices, target_fuzzy_key_to_indices,
+              target_df, compare_cols, key_cols, skip_normalisation, decimal_precision)
 
     Returns:
         Tuple of (discrepancies list, matched_target_indices set)
     """
-    source_chunk, target_key_to_indices, target_df, compare_cols, key_cols, skip_normalisation, decimal_prec = args
+    (source_chunk, target_key_to_indices, target_fuzzy_key_to_indices,
+     target_df, compare_cols, key_cols, skip_normalisation, decimal_prec) = args
 
     discrepancies: List[Dict[str, Any]] = []
     matched_target_indices: Set[Any] = set()
@@ -775,64 +907,141 @@ def compare_rows_parallel(
             for c in key_cols
         ])
         
+        matched_tgt_idx = None
+        is_fuzzy_match = False
+        fuzzy_key_differences = []
+        
+        # Step 1: Try exact key match first
         if src_key in target_key_to_indices:
             target_indices = target_key_to_indices[src_key]
-            
-            matched_tgt_idx = None
             for tgt_idx in target_indices:
                 if tgt_idx not in matched_target_indices:
                     matched_tgt_idx = tgt_idx
                     break
-            
-            if matched_tgt_idx is not None:
-                matched_target_indices.add(matched_tgt_idx)
-                tgt_row = target_df.loc[matched_tgt_idx]
-
-                # Cache normalised values for target row
-                tgt_normalised = {col: normalise_value(tgt_row[col], skip_normalisation, numeric_precision=decimal_prec) for col in compare_cols}
-                
-                differences = []
-                for col in compare_cols:
-                    norm_src = src_normalised[col]
-                    norm_tgt = tgt_normalised[col]
-                    
-                    # Compare using cached normalised values
-                    values_equal = (norm_src == norm_tgt) or (
-                        not skip_normalisation and 
-                        norm_src is not None and 
-                        norm_tgt is not None and 
-                        norm_src.lower() == norm_tgt.lower()
-                    )
-                    
-                    if not values_equal:
-                        differences.append({
-                            'column': col,
-                            'source': str(norm_src) if norm_src is not None else 'NULL',
-                            'target': str(norm_tgt) if norm_tgt is not None else 'NULL'
-                        })
-                
-                if differences:
-                    full_source_row = '|'.join([
-                        str(src_row[c]) if src_row[c] is not None else 'NULL' 
-                        for c in compare_cols
-                    ])
-                    full_target_row = '|'.join([
-                        str(tgt_row[c]) if tgt_row[c] is not None else 'NULL' 
-                        for c in compare_cols
-                    ])
-                    
-                    for diff in differences:
-                        discrepancies.append({
-                            'discrepancy_type': 'VALUE_MISMATCH',
-                            'composite_key': src_key,
-                            'column_name': diff['column'],
-                            'source_value': diff['source'],
-                            'target_value': diff['target'],
-                            'full_source_row': full_source_row,
-                            'full_target_row': full_target_row
-                        })
-                continue
         
+        # Step 2: If no exact match, try fuzzy key match
+        if matched_tgt_idx is None and target_fuzzy_key_to_indices:
+            src_fuzzy_key = build_fuzzy_key(src_row, key_cols)
+            
+            if src_fuzzy_key in target_fuzzy_key_to_indices:
+                fuzzy_candidates = target_fuzzy_key_to_indices[src_fuzzy_key]
+                
+                for tgt_idx in fuzzy_candidates:
+                    if tgt_idx in matched_target_indices:
+                        continue
+                    
+                    tgt_row = target_df.loc[tgt_idx]
+                    
+                    # Check if ALL key columns are fuzzy-similar
+                    all_keys_similar = True
+                    temp_key_diffs = []
+                    
+                    for col in key_cols:
+                        src_val = src_row[col]
+                        tgt_val = tgt_row[col]
+                        is_similar, match_type = key_values_fuzzy_equal(
+                            src_val, tgt_val, skip_normalisation, decimal_prec
+                        )
+                        
+                        if not is_similar:
+                            all_keys_similar = False
+                            break
+                        
+                        # Track key differences for reporting (even fuzzy matches)
+                        if match_type != 'EXACT':
+                            src_norm = normalise_value(src_val, skip_normalisation, numeric_precision=decimal_prec)
+                            tgt_norm = normalise_value(tgt_val, skip_normalisation, numeric_precision=decimal_prec)
+                            temp_key_diffs.append({
+                                'column': col,
+                                'source': str(src_norm) if src_norm is not None else 'NULL',
+                                'target': str(tgt_norm) if tgt_norm is not None else 'NULL',
+                                'match_type': match_type
+                            })
+                    
+                    if all_keys_similar:
+                        matched_tgt_idx = tgt_idx
+                        is_fuzzy_match = True
+                        fuzzy_key_differences = temp_key_diffs
+                        break
+        
+        # Step 3: If match found (exact or fuzzy), compare all values
+        if matched_tgt_idx is not None:
+            matched_target_indices.add(matched_tgt_idx)
+            tgt_row = target_df.loc[matched_tgt_idx]
+
+            # Cache normalised values for target row
+            tgt_normalised = {col: normalise_value(tgt_row[col], skip_normalisation, numeric_precision=decimal_prec) for col in compare_cols}
+            
+            differences = []
+            
+            # First add key column differences from fuzzy matching
+            if is_fuzzy_match and fuzzy_key_differences:
+                for key_diff in fuzzy_key_differences:
+                    differences.append({
+                        'column': key_diff['column'],
+                        'source': key_diff['source'],
+                        'target': key_diff['target'],
+                        'is_key_column': True
+                    })
+            
+            # Then compare all columns (skip key columns already reported)
+            reported_key_cols = {d['column'] for d in fuzzy_key_differences} if fuzzy_key_differences else set()
+            
+            for col in compare_cols:
+                if col in reported_key_cols:
+                    continue
+                    
+                norm_src = src_normalised[col]
+                norm_tgt = tgt_normalised[col]
+                
+                # Compare using cached normalised values
+                values_equal = (norm_src == norm_tgt) or (
+                    not skip_normalisation and 
+                    norm_src is not None and 
+                    norm_tgt is not None and 
+                    norm_src.lower() == norm_tgt.lower()
+                )
+                
+                if not values_equal:
+                    differences.append({
+                        'column': col,
+                        'source': str(norm_src) if norm_src is not None else 'NULL',
+                        'target': str(norm_tgt) if norm_tgt is not None else 'NULL',
+                        'is_key_column': col in key_cols
+                    })
+            
+            if differences:
+                full_source_row = '|'.join([
+                    str(src_row[c]) if src_row[c] is not None else 'NULL' 
+                    for c in compare_cols
+                ])
+                full_target_row = '|'.join([
+                    str(tgt_row[c]) if tgt_row[c] is not None else 'NULL' 
+                    for c in compare_cols
+                ])
+                
+                # Build the target key for reporting
+                tgt_key = '||'.join([
+                    f"{c}={str(tgt_normalised[c]) if tgt_normalised[c] is not None else 'NULL'}"
+                    for c in key_cols
+                ])
+                
+                for diff in differences:
+                    # Use KEY_VALUE_MISMATCH for key column differences, VALUE_MISMATCH for others
+                    disc_type = 'KEY_VALUE_MISMATCH' if diff.get('is_key_column') else 'VALUE_MISMATCH'
+                    
+                    discrepancies.append({
+                        'discrepancy_type': disc_type,
+                        'composite_key': f"{src_key} ~> {tgt_key}" if is_fuzzy_match else src_key,
+                        'column_name': diff['column'],
+                        'source_value': diff['source'],
+                        'target_value': diff['target'],
+                        'full_source_row': full_source_row,
+                        'full_target_row': full_target_row
+                    })
+            continue
+        
+        # Step 4: No match found - report as missing
         full_row_data = '|'.join([
             str(src_row[c]) if src_row[c] is not None else 'NULL' 
             for c in compare_cols
@@ -1070,20 +1279,28 @@ class HighPerformanceComparator:
 
         logger.info("\n  Building target index...")
         target_key_to_indices: DefaultDict[str, List[Any]] = defaultdict(list)
+        target_fuzzy_key_to_indices: DefaultDict[str, List[Any]] = defaultdict(list)
 
         for idx, row in target_unmatched.iterrows():
+            # Build exact key
             key = '||'.join([
                 f"{c}={str(row[c]) if row[c] is not None else 'NULL'}"
                 for c in key_cols
             ])
             target_key_to_indices[key].append(idx)
+            
+            # Build fuzzy key for fallback matching
+            fuzzy_key = build_fuzzy_key(row, key_cols)
+            target_fuzzy_key_to_indices[fuzzy_key].append(idx)
 
         duplicate_keys = {k: v for k, v in target_key_to_indices.items() if len(v) > 1}
         if duplicate_keys:
             logger.warning(f"  [!] Warning: {len(duplicate_keys)} duplicate keys found in unmatched target rows")
+        
+        logger.info(f"  Built {len(target_key_to_indices):,} exact keys, {len(target_fuzzy_key_to_indices):,} fuzzy keys")
 
-        logger.info("  Running parallel deep comparison...")
-        self._parallel_deep_comparison(source_unmatched, target_unmatched, target_key_to_indices, compare_cols, key_cols)
+        logger.info("  Running parallel deep comparison (with fuzzy key matching)...")
+        self._parallel_deep_comparison(source_unmatched, target_unmatched, target_key_to_indices, target_fuzzy_key_to_indices, compare_cols, key_cols)
 
         return self.discrepancies
 
@@ -1176,16 +1393,19 @@ class HighPerformanceComparator:
         source_df: pd.DataFrame,
         target_df: pd.DataFrame,
         target_key_to_indices: Dict[str, List[Any]],
+        target_fuzzy_key_to_indices: Dict[str, List[Any]],
         compare_cols: List[str],
         key_cols: List[str]
     ) -> None:
         """
         Perform deep comparison using parallel processing.
+        Supports both exact and fuzzy key matching.
 
         Args:
             source_df: Source DataFrame (unmatched rows only)
             target_df: Target DataFrame (unmatched rows only)
-            target_key_to_indices: Mapping of composite keys to target row indices
+            target_key_to_indices: Mapping of exact composite keys to target row indices
+            target_fuzzy_key_to_indices: Mapping of fuzzy keys to target row indices
             compare_cols: Columns to compare
             key_cols: Key columns for composite key
         """
@@ -1203,11 +1423,12 @@ class HighPerformanceComparator:
         total_chunks = len(chunks)
 
         target_key_dict = dict(target_key_to_indices)
+        target_fuzzy_key_dict = dict(target_fuzzy_key_to_indices)
 
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
             futures = []
             for chunk in chunks:
-                args = (chunk, target_key_dict, target_df, compare_cols, key_cols, self.skip_normalisation, self.decimal_precision)
+                args = (chunk, target_key_dict, target_fuzzy_key_dict, target_df, compare_cols, key_cols, self.skip_normalisation, self.decimal_precision)
                 futures.append(executor.submit(compare_rows_parallel, args))
 
             for future in as_completed(futures):
@@ -1253,22 +1474,66 @@ class HighPerformanceComparator:
         logger.info(f"    Rows only in target: {missing_in_source:,}")
 
 
+def _write_chunk_to_csv(args: Tuple[pd.DataFrame, str, bool]) -> str:
+    """
+    Write a DataFrame chunk to a temporary CSV file.
+    
+    Args:
+        args: Tuple of (chunk_df, temp_dir, include_header)
+    
+    Returns:
+        Path to the temporary file
+    """
+    chunk_df, temp_dir, include_header = args
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.csv', dir=temp_dir)
+    with os.fdopen(temp_fd, 'w', encoding='utf-8', newline='') as f:
+        chunk_df.to_csv(f, index=False, header=include_header)
+    return temp_path
+
+
+def _compute_stats_chunk(args: Tuple[pd.DataFrame, str]) -> Dict[str, Any]:
+    """
+    Compute statistics for a chunk of the report DataFrame.
+    
+    Args:
+        args: Tuple of (chunk_df, stat_type)
+    
+    Returns:
+        Dictionary with statistics
+    """
+    chunk_df, stat_type = args
+    
+    if stat_type == 'type_counts':
+        return {'type_counts': chunk_df['discrepancy_type'].value_counts().to_dict()}
+    elif stat_type == 'column_counts':
+        mismatch_df = chunk_df[chunk_df['discrepancy_type'] == 'VALUE_MISMATCH']
+        if len(mismatch_df) > 0:
+            return {'column_counts': mismatch_df['column_name'].value_counts().to_dict()}
+        return {'column_counts': {}}
+    return {}
+
+
 def generate_report(
     discrepancies: List[Dict[str, Any]],
     output_file: str,
-    column_headers: Optional[List[str]] = None
+    column_headers: Optional[List[str]] = None,
+    num_workers: Optional[int] = None
 ) -> None:
     """
-    Generate detailed CSV report with column reference.
+    Generate detailed CSV report with column reference using parallel processing.
 
     Args:
         discrepancies: List of discrepancy dictionaries
         output_file: Path to output CSV file
         column_headers: Optional list of column names for reference file
+        num_workers: Number of parallel workers (default: CPU count - 1)
     """
     logger.info("\n" + "=" * 60)
     logger.info("REPORT GENERATION")
     logger.info("=" * 60)
+
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() - 1)
 
     if not discrepancies:
         logger.info("\n[OK] SUCCESS: No discrepancies found!")
@@ -1280,6 +1545,10 @@ def generate_report(
         logger.info(f"\n[OK] Empty report saved to: {output_file}")
         return
 
+    total_discrepancies = len(discrepancies)
+    logger.info(f"\n  Processing {total_discrepancies:,} discrepancies with {num_workers} workers...")
+
+    # Convert to DataFrame
     df = pd.DataFrame(discrepancies)
 
     col_order = [
@@ -1287,11 +1556,48 @@ def generate_report(
         'source_value', 'target_value', 'full_source_row', 'full_target_row'
     ]
     df = df[[c for c in col_order if c in df.columns]]
-    df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
 
-    df.to_csv(output_file, index=False)
+    # For small datasets, use single-threaded approach
+    if total_discrepancies < 10_000:
+        df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
+        df.to_csv(output_file, index=False)
+    else:
+        # Parallel sorting and writing for large datasets
+        logger.info("  Sorting discrepancies...")
+        df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
 
-    logger.info(f"\n[X] DISCREPANCIES FOUND: {len(discrepancies):,}")
+        logger.info("  Writing report in parallel chunks...")
+        chunk_size = max(5000, total_discrepancies // (num_workers * 2))
+        chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+
+        temp_dir = tempfile.mkdtemp(prefix='csv_report_')
+        try:
+            # Write chunks in parallel
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                args_list = [(chunk, temp_dir, i == 0) for i, chunk in enumerate(chunks)]
+                temp_files = list(executor.map(_write_chunk_to_csv, args_list))
+
+            # Concatenate temp files into final output
+            with open(output_file, 'wb') as outfile:
+                for temp_file in temp_files:
+                    with open(temp_file, 'rb') as infile:
+                        outfile.write(infile.read())
+
+            # Cleanup temp files
+            for temp_file in temp_files:
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+        finally:
+            try:
+                os.rmdir(temp_dir)
+            except OSError:
+                pass
+
+    # Compute and display statistics
+    logger.info(f"\n[X] DISCREPANCIES FOUND: {total_discrepancies:,}")
+    
     logger.info("\nBreakdown by type:")
     for dtype, count in df['discrepancy_type'].value_counts().items():
         logger.info(f"  {dtype}: {count:,}")
@@ -1347,6 +1653,8 @@ def parse_arguments() -> argparse.Namespace:
                         help="Disable value normalisation (nulls, booleans, timestamps, numbers)")
     parser.add_argument("--decimal-precision", dest="decimal_precision", type=int, default=6,
                         help="Number of decimal places for numeric comparison (default: 6)")
+    parser.add_argument("--esc-char", dest="escape_char", type=str, default=None,
+                        help="Escape character for CSV parsing (e.g., --esc-char \"\\\\\" for backslash). Default: None")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable verbose/debug logging")
 
@@ -1373,8 +1681,9 @@ def main() -> None:
         output_dir = args.output_dir
         skip_normalisation = args.no_normalisation
         decimal_precision = args.decimal_precision
+        escape_char = args.escape_char
     else:
-        logger.info("\nUsage: python csv_comparator.py <source_csv> <target_csv> [key_col1 key_col2 ...] [--output-dir DIR] [--no-normalisation] [--decimal-precision N]")
+        logger.info("\nUsage: python csv_comparator.py <source_csv> <target_csv> [key_col1 key_col2 ...] [--output-dir DIR] [--no-normalisation] [--decimal-precision N] [--esc-char CHAR]")
         logger.info("\nKey columns are optional - auto-detected if not provided.")
         source_file = input("Source (Hive) CSV path: ").strip()
         target_file = input("Target (Snowflake) CSV path: ").strip()
@@ -1383,6 +1692,7 @@ def main() -> None:
         output_dir = None
         skip_normalisation = False
         decimal_precision = DEFAULT_NUMERIC_PRECISION
+        escape_char = None
 
     for path, name in [(source_file, "Source"), (target_file, "Target")]:
         if not os.path.exists(path):
@@ -1396,11 +1706,12 @@ def main() -> None:
         logger.info(f"Output directory: {output_dir}")
     logger.info(f"Normalisation: {'Disabled' if skip_normalisation else 'Enabled'}")
     logger.info(f"Decimal precision: {decimal_precision}")
+    logger.info(f"Escape character: {repr(escape_char) if escape_char else 'None'}")
 
     logger.info("\n" + "-" * 40)
     logger.info("Loading files...")
-    source_df = load_csv_file(source_file, "Source (Hive)")
-    target_df = load_csv_file(target_file, "Target (Snowflake)")
+    source_df = load_csv_file(source_file, "Source (Hive)", escape_char)
+    target_df = load_csv_file(target_file, "Target (Snowflake)", escape_char)
 
     comparator = HighPerformanceComparator(
         source_df, target_df, key_columns, skip_normalisation, decimal_precision=decimal_precision

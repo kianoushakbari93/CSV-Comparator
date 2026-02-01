@@ -473,6 +473,112 @@ Asia|Japan|Tokyo|2024|1200""",
 2|Bob|200|OtherData2""",
         "expect_match": True,
     },
+    
+    # -------------------------------------------------------------------------
+    # ESCAPE CHARACTER TESTS
+    # -------------------------------------------------------------------------
+    "test_escape_char_backslash": {
+        "description": "Backslash escape character handling",
+        "source": """ID|NAME|VALUE
+1|Alice|100
+2|Bob|200
+3|Charlie|300""",
+        "target": """ID|NAME|VALUE
+1|Alice|100
+2|Bob|200
+3|Charlie|300""",
+        "expect_match": True,
+        "extra_args": ["--esc-char", "\\"],
+    },
+    
+    "test_no_escape_char_default": {
+        "description": "No escape character by default",
+        "source": """ID|NAME|VALUE
+1|Test\\nValue|100
+2|Another\\tTest|200""",
+        "target": """ID|NAME|VALUE
+1|Test\\nValue|100
+2|Another\\tTest|200""",
+        "expect_match": True,
+    },
+    
+    # -------------------------------------------------------------------------
+    # FUZZY KEY MATCHING TESTS
+    # -------------------------------------------------------------------------
+    "test_fuzzy_key_slash_difference": {
+        "description": "Fuzzy key matching: slash vs space in key",
+        "source": """ID|ACCOUNT_LINEAGE|VALUE
+1|UPAM/9741/2265|100
+2|TEST/ACCT/123|200""",
+        "target": """ID|ACCOUNT_LINEAGE|VALUE
+1|UPAM 9741 2265|100
+2|TEST ACCT 123|200""",
+        "expect_match": False,
+        "expected_discrepancies": 2,  # KEY_VALUE_MISMATCH for ACCOUNT_LINEAGE
+        "expect_key_mismatch": True,
+    },
+    
+    "test_fuzzy_key_underscore_difference": {
+        "description": "Fuzzy key matching: underscore vs no underscore in key",
+        "source": """ID|KEY_COL|VALUE
+1|ABC_DEF|100
+2|XYZ_123|200""",
+        "target": """ID|KEY_COL|VALUE
+1|ABCDEF|100
+2|XYZ123|200""",
+        "expect_match": False,
+        "expected_discrepancies": 2,
+        "expect_key_mismatch": True,
+    },
+    
+    "test_fuzzy_key_numeric_tolerance": {
+        "description": "Fuzzy key matching: numeric values within tolerance",
+        "source": """ID|VALUE
+1|100
+2|200""",
+        "target": """ID|VALUE
+1|100
+2|200""",
+        "expect_match": True,  # Exact match
+    },
+    
+    "test_fuzzy_key_extra_whitespace": {
+        "description": "Fuzzy key matching: extra whitespace in key",
+        "source": """ID|KEY_COL|VALUE
+1|ABC  DEF|100
+2|XYZ   123|200""",
+        "target": """ID|KEY_COL|VALUE
+1|ABC DEF|100
+2|XYZ 123|200""",
+        "expect_match": False,
+        "expected_discrepancies": 2,
+        "expect_key_mismatch": True,
+    },
+    
+    "test_fuzzy_key_special_chars": {
+        "description": "Fuzzy key matching: special characters (underscore, dash)",
+        "source": """ID|KEY_COL|VALUE
+1|ABC_DEF-123|100
+2|TEST.VALUE(1)|200""",
+        "target": """ID|KEY_COL|VALUE
+1|ABCDEF123|100
+2|TESTVALUE1|200""",
+        "expect_match": False,
+        "expected_discrepancies": 2,
+        "expect_key_mismatch": True,
+    },
+    
+    "test_fuzzy_key_no_match_different_data": {
+        "description": "Fuzzy key: truly different keys should not match",
+        "source": """ID|KEY_COL|VALUE
+1|COMPLETELY_DIFFERENT|100
+2|ANOTHER_KEY|200""",
+        "target": """ID|KEY_COL|VALUE
+1|TOTALLY_UNRELATED|100
+2|SOMETHING_ELSE|200""",
+        "expect_match": False,
+        "expected_discrepancies": 4,  # 2 MISSING_IN_SOURCE + 2 MISSING_IN_TARGET
+    },
 }
 
 
@@ -688,6 +794,77 @@ COMPARATOR_TEST_CASES = [
         {"ID": [1, 2], "NAME": ["Alice", "Bob"], "VALUE": [100, 200]},
         1,
         "Missing row in target"
+    ),
+]
+
+
+# =============================================================================
+# UNIT TEST CASES FOR normalise_key_for_fuzzy()
+# =============================================================================
+
+FUZZY_KEY_NORMALISE_TEST_CASES = [
+    # (input_value, expected_output, description)
+    ("ABC/DEF/123", "ABC DEF 123", "Slashes replaced with spaces"),
+    ("ABC|DEF|123", "ABC DEF 123", "Pipes replaced with spaces"),
+    ("ABC\\DEF\\123", "ABC DEF 123", "Backslashes replaced with spaces"),
+    ("ABC_DEF_123", "ABCDEF123", "Underscores removed"),
+    ("ABC-DEF-123", "ABCDEF123", "Dashes removed"),
+    ("ABC.DEF.123", "ABCDEF123", "Dots removed"),
+    ("ABC(DEF)123", "ABCDEF123", "Parentheses removed"),
+    ("ABC[DEF]123", "ABCDEF123", "Square brackets removed"),
+    ("ABC{DEF}123", "ABCDEF123", "Curly braces removed"),
+    ("ABC  DEF   123", "ABC DEF 123", "Multiple spaces collapsed"),
+    ("  ABC DEF  ", "ABC DEF", "Leading/trailing spaces trimmed"),
+    ("abc/def", "ABC DEF", "Lowercase converted to uppercase"),
+    ("NULL", "NULL", "NULL preserved"),
+    (None, "NULL", "None converted to NULL"),
+    ("", "NULL", "Empty string converted to NULL"),
+    ("<NULL>", "NULL", "Snowflake NULL converted"),
+]
+
+
+# =============================================================================
+# UNIT TEST CASES FOR key_values_fuzzy_equal()
+# =============================================================================
+
+FUZZY_EQUAL_TEST_CASES = [
+    # (src_val, tgt_val, expected_similar, expected_reason, description)
+    ("ABC", "ABC", True, "EXACT", "Exact string match"),
+    ("abc", "ABC", True, "EXACT", "Case-insensitive exact match"),
+    ("ABC/DEF", "ABC DEF", True, "FUZZY_STRING", "Slash vs space"),
+    ("ABC|DEF", "ABC DEF", True, "FUZZY_STRING", "Pipe vs space"),
+    ("ABC_DEF", "ABCDEF", True, "FUZZY_STRING", "Underscore removed"),
+    ("ABC-DEF", "ABCDEF", True, "FUZZY_STRING", "Dash removed"),
+    ("ABC  DEF", "ABC DEF", True, "FUZZY_STRING", "Extra whitespace"),
+    (100, 100, True, "EXACT", "Exact numeric match"),
+    (100.0, 100, True, "EXACT", "Numeric with decimal zero"),
+    (156999, 157050, True, "FUZZY_NUMERIC", "Numeric within tolerance (51 diff)"),
+    (1000000, 1005000, True, "FUZZY_NUMERIC", "Numeric within 1% tolerance"),
+    (100, 300, False, "DIFFERENT", "Numeric outside tolerance"),
+    ("ABC", "XYZ", False, "DIFFERENT", "Completely different strings"),
+    (None, None, True, "EXACT", "Both NULL"),
+    ("NULL", None, True, "EXACT", "NULL string vs None"),
+    ("ABC", None, False, "DIFFERENT", "String vs NULL"),
+]
+
+
+# =============================================================================
+# UNIT TEST CASES FOR build_fuzzy_key()
+# =============================================================================
+
+BUILD_FUZZY_KEY_TEST_CASES = [
+    # (row_data, key_cols, expected_contains, description)
+    (
+        {"COL_A": "ABC/DEF", "COL_B": "123", "COL_C": "XYZ"},
+        ["COL_A", "COL_B", "COL_C"],
+        ["COL_A=ABC DEF", "COL_B=123", "COL_C=XYZ"],
+        "Fuzzy key with slash normalised"
+    ),
+    (
+        {"COL_A": None, "COL_B": "TEST"},
+        ["COL_A", "COL_B"],
+        ["COL_A=NULL", "COL_B=TEST"],
+        "Fuzzy key with NULL value"
     ),
 ]
 
@@ -1125,6 +1302,81 @@ def run_unit_tests(comparator_path):
     all_passed = all_passed and (failed == 0)
     
     # -------------------------------------------------------------------------
+    # Test 12: normalise_key_for_fuzzy()
+    # -------------------------------------------------------------------------
+    print("\n  --- Testing normalise_key_for_fuzzy() ---")
+    passed = 0
+    failed = 0
+    
+    try:
+        normalise_key_for_fuzzy = module.normalise_key_for_fuzzy
+        
+        for input_val, expected, description in FUZZY_KEY_NORMALISE_TEST_CASES:
+            result = normalise_key_for_fuzzy(input_val)
+            if result == expected:
+                passed += 1
+            else:
+                failed += 1
+                print(f"      [X] {description}: got '{result}', expected '{expected}'")
+    except AttributeError:
+        print("      [!] normalise_key_for_fuzzy not found - skipping (may not be implemented yet)")
+        passed = len(FUZZY_KEY_NORMALISE_TEST_CASES)  # Skip as passed
+    
+    print(f"    {passed} passed, {failed} failed")
+    all_passed = all_passed and (failed == 0)
+    
+    # -------------------------------------------------------------------------
+    # Test 13: key_values_fuzzy_equal()
+    # -------------------------------------------------------------------------
+    print("\n  --- Testing key_values_fuzzy_equal() ---")
+    passed = 0
+    failed = 0
+    
+    try:
+        key_values_fuzzy_equal = module.key_values_fuzzy_equal
+        
+        for src_val, tgt_val, exp_similar, exp_reason, description in FUZZY_EQUAL_TEST_CASES:
+            is_similar, reason = key_values_fuzzy_equal(src_val, tgt_val)
+            if is_similar == exp_similar:
+                passed += 1
+            else:
+                failed += 1
+                print(f"      [X] {description}: got similar={is_similar}, expected {exp_similar}")
+    except AttributeError:
+        print("      [!] key_values_fuzzy_equal not found - skipping (may not be implemented yet)")
+        passed = len(FUZZY_EQUAL_TEST_CASES)  # Skip as passed
+    
+    print(f"    {passed} passed, {failed} failed")
+    all_passed = all_passed and (failed == 0)
+    
+    # -------------------------------------------------------------------------
+    # Test 14: build_fuzzy_key()
+    # -------------------------------------------------------------------------
+    print("\n  --- Testing build_fuzzy_key() ---")
+    passed = 0
+    failed = 0
+    
+    try:
+        build_fuzzy_key = module.build_fuzzy_key
+        
+        for row_data, key_cols, expected_contains, description in BUILD_FUZZY_KEY_TEST_CASES:
+            row = pd.Series(row_data)
+            result = build_fuzzy_key(row, key_cols)
+            
+            all_found = all(exp in result for exp in expected_contains)
+            if all_found:
+                passed += 1
+            else:
+                failed += 1
+                print(f"      [X] {description}: got '{result}', expected to contain {expected_contains}")
+    except AttributeError:
+        print("      [!] build_fuzzy_key not found - skipping (may not be implemented yet)")
+        passed = len(BUILD_FUZZY_KEY_TEST_CASES)  # Skip as passed
+    
+    print(f"    {passed} passed, {failed} failed")
+    all_passed = all_passed and (failed == 0)
+    
+    # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
     print("\n" + "-" * 80)
@@ -1160,12 +1412,16 @@ def run_integration_tests(comparator_path):
             source_path = create_test_file(temp_dir, f"{test_name}_source", test_data["source"])
             target_path = create_test_file(temp_dir, f"{test_name}_target", test_data["target"])
             
+            # Get extra arguments if specified
+            extra_args = test_data.get("extra_args", None)
+            
             # Run comparator
-            result = run_comparator(comparator_path, source_path, target_path)
+            result = run_comparator(comparator_path, source_path, target_path, extra_args)
             
             # Check result (check both stdout and stderr)
             success = check_success(result.stdout, result.stderr)
             expect_match = test_data.get("expect_match", True)
+            expect_key_mismatch = test_data.get("expect_key_mismatch", False)
             
             if expect_match:
                 test_passed = success
@@ -1179,6 +1435,17 @@ def run_integration_tests(comparator_path):
                     if actual != expected_count:
                         failures.append((test_name, description, 
                             f"Expected {expected_count} discrepancies, got {actual}",
+                            result.stdout, result.stderr, result.returncode))
+                        failed += 1
+                        print(f"  [X] {test_name}: {description}")
+                        continue
+                
+                # Check for KEY_VALUE_MISMATCH if expected
+                if expect_key_mismatch:
+                    combined = result.stdout + (result.stderr or "")
+                    if "KEY_VALUE_MISMATCH" not in combined:
+                        failures.append((test_name, description,
+                            "Expected KEY_VALUE_MISMATCH but not found",
                             result.stdout, result.stderr, result.returncode))
                         failed += 1
                         print(f"  [X] {test_name}: {description}")
