@@ -86,7 +86,7 @@ python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precisio
 # Use 2 decimal places for currency values
 python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precision 2
 
-# Use backslash as escape character (for Hive exports with backslash escaping)
+# Use backslash as escape character (for CSV exports with backslash escaping)
 python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\\"
 
 # Use tilde as escape character
@@ -174,7 +174,7 @@ When rows are matched via fuzzy matching:
 
 The `--esc-char` option allows you to specify an escape character for CSV parsing. This is useful when:
 
-- Hive exports use backslash escaping (`\|`, `\n`, `\"`)
+- CSV exports use backslash escaping (`\|`, `\n`, `\"`)
 - CSV files contain special characters that need escaping
 - Different systems use different escape conventions
 
