@@ -56,6 +56,11 @@ COLUMN_EXCLUSION_PATTERNS: List[str] = [
     r'.*_?AUDIT.*', r'.*_?INSERT.*', r'.*_?UPDATE.*',
     r'^ROW_.*', r'.*_?SOURCE$', r'.*_?SRC$', r'.*_?NAME$', r'^NAME_?.*',
     r'.*_?STATUS.*', r'.*_?FLAG.*', r'.*_?IND$', r'.*_?INDICATOR.*',
+    # ETL metadata columns (UUIDs, extract IDs, generated values)
+    r'.*_?UUID.*', r'.*_?GUID.*', r'.*_?HASH$',
+    r'^EDD_.*', r'^ETL_.*', r'^DW_.*', r'^DWH_.*',
+    r'.*_?EXTRACT_.*', r'^EXTRACT_.*',
+    r'^GENERATED_.*', r'.*_GENERATED$',
 ]
 
 # Default timestamp precision (number of decimal places to preserve, None = strip all)
@@ -355,6 +360,9 @@ def preprocess_quoted_rows(filepath: str) -> Tuple[str, int]:
         "value1|value2|value3"
     This causes delimiters inside to be treated as data, not separators.
 
+    This function does NOT modify properly quoted CSVs where each field is quoted:
+        "value1","value2","value3"
+
     Args:
         filepath: Path to the CSV file to process
 
@@ -370,11 +378,36 @@ def preprocess_quoted_rows(filepath: str) -> Tuple[str, int]:
         if b'\r\n' in sample:
             has_crlf = True
 
+    def is_errant_quoted_row(line: str) -> bool:
+        """
+        Check if a line is errantly quoted (entire row wrapped in quotes).
+        
+        Returns True for: "value1|value2|value3" (errant quoting)
+        Returns True for: ""value1","value2","value3"" (errant + proper quoting)
+        Returns False for: "value1","value2","value3" (properly quoted CSV only)
+        """
+        stripped = line.rstrip('\r\n')
+        if not (stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 1):
+            return False
+        
+        # Check for double-quote at start AND end - this is errant quoting around proper CSV
+        # e.g., ""value1","value2","value3""
+        if stripped.startswith('""') and stripped.endswith('""') and len(stripped) > 3:
+            return True  # Errant quoting around a properly quoted row
+        
+        # Check if this is a properly quoted CSV (fields separated by delimiter between quotes)
+        # Look for patterns like "," or "|" or "\t" which indicate proper field quoting
+        proper_csv_patterns = ['","', '"|"', '"\t"', '";"', '"~"']
+        for pattern in proper_csv_patterns:
+            if pattern in stripped:
+                return False  # This is a properly quoted CSV, not errant
+        
+        return True  # This is an errant quoted row
+
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         f.readline()  # Skip header
         for line in f:
-            stripped = line.rstrip('\r\n')
-            if stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 1:
+            if is_errant_quoted_row(line):
                 rows_needing_quote_fix += 1
 
     if rows_needing_quote_fix == 0 and not has_crlf:
@@ -388,7 +421,7 @@ def preprocess_quoted_rows(filepath: str) -> Tuple[str, int]:
 
         for line in infile:
             stripped = line.rstrip('\r\n')
-            if stripped.startswith('"') and stripped.endswith('"') and len(stripped) > 1:
+            if is_errant_quoted_row(line):
                 stripped = stripped[1:-1]
             outfile.write(stripped + '\n')
 
@@ -1058,6 +1091,45 @@ def compare_rows_parallel(
     return discrepancies, matched_target_indices
 
 
+def identify_missing_in_source_parallel(
+    args: Tuple[List[Any], pd.DataFrame, List[str], List[str]]
+) -> List[Dict[str, Any]]:
+    """
+    Identify rows that exist in target but not in source (MISSING_IN_SOURCE).
+    Used for parallel processing.
+
+    Args:
+        args: Tuple of (unmatched_indices, target_df, compare_cols, key_cols)
+
+    Returns:
+        List of discrepancy dictionaries
+    """
+    unmatched_indices, target_df, compare_cols, key_cols = args
+    discrepancies: List[Dict[str, Any]] = []
+
+    for tgt_idx in unmatched_indices:
+        tgt_row = target_df.loc[tgt_idx]
+        key = '||'.join([
+            f"{c}={str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'}"
+            for c in key_cols
+        ])
+        full_row_data = '|'.join([
+            str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'
+            for c in compare_cols
+        ])
+        discrepancies.append({
+            'discrepancy_type': 'MISSING_IN_SOURCE',
+            'composite_key': key,
+            'column_name': 'ALL',
+            'source_value': 'ROW_NOT_FOUND',
+            'target_value': full_row_data,
+            'full_source_row': 'ROW_NOT_FOUND',
+            'full_target_row': full_row_data
+        })
+
+    return discrepancies
+
+
 class HighPerformanceComparator:
     """High-performance CSV comparison engine with parallel processing."""
 
@@ -1440,28 +1512,29 @@ class HighPerformanceComparator:
                     pct = (processed / total_chunks) * 100
                     logger.info(f"    Progress: {processed}/{total_chunks} chunks ({pct:.0f}%)")
 
-        logger.info("  Identifying rows only in target...")
+        logger.info("  Identifying rows only in target (parallel)...")
         unmatched_target_indices = all_target_indices - all_matched_target_indices
-
-        for tgt_idx in unmatched_target_indices:
-            tgt_row = target_df.loc[tgt_idx]
-            key = '||'.join([
-                f"{c}={str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'}"
-                for c in key_cols
-            ])
-            full_row_data = '|'.join([
-                str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'
-                for c in compare_cols
-            ])
-            self.discrepancies.append({
-                'discrepancy_type': 'MISSING_IN_SOURCE',
-                'composite_key': key,
-                'column_name': 'ALL',
-                'source_value': 'ROW_NOT_FOUND',
-                'target_value': full_row_data,
-                'full_source_row': 'ROW_NOT_FOUND',
-                'full_target_row': full_row_data
-            })
+        
+        if unmatched_target_indices:
+            # Convert to list and chunk for parallel processing
+            unmatched_list = list(unmatched_target_indices)
+            chunk_size = max(500, len(unmatched_list) // (self.num_workers * 4))
+            unmatched_chunks = [
+                unmatched_list[i:i + chunk_size] 
+                for i in range(0, len(unmatched_list), chunk_size)
+            ]
+            
+            logger.info(f"    Processing {len(unmatched_list):,} unmatched rows in {len(unmatched_chunks)} chunks...")
+            
+            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
+                for chunk in unmatched_chunks:
+                    args = (chunk, target_df, compare_cols, key_cols)
+                    futures.append(executor.submit(identify_missing_in_source_parallel, args))
+                
+                for future in as_completed(futures):
+                    chunk_discrepancies = future.result()
+                    self.discrepancies.extend(chunk_discrepancies)
         
         matched_count = len(all_matched_target_indices)
         missing_in_target = len(source_df) - matched_count
@@ -1494,16 +1567,19 @@ def generate_report(
     discrepancies: List[Dict[str, Any]],
     output_file: str,
     column_headers: Optional[List[str]] = None,
-    num_workers: Optional[int] = None
+    num_workers: Optional[int] = None,
+    output_format: str = "xlsx"
 ) -> None:
     """
-    Generate detailed CSV report with column reference using parallel processing.
+    Generate detailed report with column reference using parallel processing.
+    Supports CSV and XLSX formats. XLSX files are automatically split if exceeding 1M rows.
 
     Args:
         discrepancies: List of discrepancy dictionaries
-        output_file: Path to output CSV file
+        output_file: Path to output file (extension will be adjusted based on format)
         column_headers: Optional list of column names for reference file
         num_workers: Number of parallel workers (default: CPU count - 1)
+        output_format: Output format - 'csv' or 'xlsx' (default: xlsx)
     """
     logger.info("\n" + "=" * 60)
     logger.info("REPORT GENERATION")
@@ -1512,13 +1588,21 @@ def generate_report(
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() - 1)
 
+    # Adjust output file extension based on format
+    base_output = os.path.splitext(output_file)[0]
+    
     if not discrepancies:
         logger.info("\n[OK] SUCCESS: No discrepancies found!")
         df = pd.DataFrame(columns=[
             'discrepancy_type', 'composite_key', 'column_name',
             'source_value', 'target_value', 'full_source_row', 'full_target_row'
         ])
-        df.to_csv(output_file, index=False)
+        if output_format == "xlsx":
+            output_file = base_output + ".xlsx"
+            df.to_excel(output_file, index=False, engine='openpyxl')
+        else:
+            output_file = base_output + ".csv"
+            df.to_csv(output_file, index=False)
         logger.info(f"\n[OK] Empty report saved to: {output_file}")
         return
 
@@ -1534,43 +1618,46 @@ def generate_report(
     ]
     df = df[[c for c in col_order if c in df.columns]]
 
-    # For small datasets, use single-threaded approach
-    if total_discrepancies < 10_000:
-        df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
-        df.to_csv(output_file, index=False)
-    else:
-        # Parallel sorting and writing for large datasets
+    # Sort the data
+    if total_discrepancies >= 10_000:
         logger.info("  Sorting discrepancies...")
-        df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
+    df = df.sort_values(['discrepancy_type', 'composite_key', 'column_name'])
 
-        logger.info("  Writing report in parallel chunks...")
-        chunk_size = max(5000, total_discrepancies // (num_workers * 2))
-        chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
+    # Generate output based on format
+    if output_format == "xlsx":
+        output_files = _generate_xlsx_report(df, base_output, total_discrepancies)
+        output_file = output_files[0] if len(output_files) == 1 else output_files
+    else:
+        output_file = base_output + ".csv"
+        if total_discrepancies < 10_000:
+            df.to_csv(output_file, index=False)
+        else:
+            # Parallel writing for large datasets
+            logger.info("  Writing report in parallel chunks...")
+            chunk_size = max(5000, total_discrepancies // (num_workers * 2))
+            chunks = [df.iloc[i:i + chunk_size] for i in range(0, len(df), chunk_size)]
 
-        temp_dir = tempfile.mkdtemp(prefix='csv_report_')
-        try:
-            # Write chunks in parallel
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                args_list = [(chunk, temp_dir, i == 0) for i, chunk in enumerate(chunks)]
-                temp_files = list(executor.map(_write_chunk_to_csv, args_list))
+            temp_dir = tempfile.mkdtemp(prefix='csv_report_')
+            try:
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    args_list = [(chunk, temp_dir, i == 0) for i, chunk in enumerate(chunks)]
+                    temp_files = list(executor.map(_write_chunk_to_csv, args_list))
 
-            # Concatenate temp files into final output
-            with open(output_file, 'wb') as outfile:
+                with open(output_file, 'wb') as outfile:
+                    for temp_file in temp_files:
+                        with open(temp_file, 'rb') as infile:
+                            outfile.write(infile.read())
+
                 for temp_file in temp_files:
-                    with open(temp_file, 'rb') as infile:
-                        outfile.write(infile.read())
-
-            # Cleanup temp files
-            for temp_file in temp_files:
+                    try:
+                        os.remove(temp_file)
+                    except OSError:
+                        pass
+            finally:
                 try:
-                    os.remove(temp_file)
+                    os.rmdir(temp_dir)
                 except OSError:
                     pass
-        finally:
-            try:
-                os.rmdir(temp_dir)
-            except OSError:
-                pass
 
     # Compute and display statistics
     logger.info(f"\n[X] DISCREPANCIES FOUND: {total_discrepancies:,}")
@@ -1586,10 +1673,15 @@ def generate_report(
         for col, count in col_counts.items():
             logger.info(f"  {col}: {count:,}")
 
-    logger.info(f"\n[OK] Report saved to: {output_file}")
+    if isinstance(output_file, list):
+        logger.info(f"\n[OK] Report saved to {len(output_file)} files:")
+        for f in output_file:
+            logger.info(f"  - {f}")
+    else:
+        logger.info(f"\n[OK] Report saved to: {output_file}")
 
     if column_headers:
-        ref_file = output_file.replace('.csv', '_column_reference.txt')
+        ref_file = base_output + "_column_reference.txt"
         with open(ref_file, 'w') as f:
             f.write("COLUMN REFERENCE FOR ROW DATA\n")
             f.write("=" * 50 + "\n\n")
@@ -1607,6 +1699,123 @@ def generate_report(
     for col in ['source_value', 'target_value']:
         sample_df[col] = sample_df[col].apply(lambda x: x[:50] + '...' if len(str(x)) > 50 else x)
     logger.info(sample_df.to_string(index=False))
+
+
+def _write_xlsx_file_parallel(args: Tuple[pd.DataFrame, str, int, int]) -> str:
+    """
+    Write a DataFrame to an XLSX file with formatting.
+    Used for parallel processing.
+    
+    Args:
+        args: Tuple of (df, output_file, part_num, total_parts)
+        
+    Returns:
+        Output file path
+    """
+    df, output_file, part_num, total_parts = args
+    
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils.dataframe import dataframe_to_rows
+    
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Discrepancies"
+    
+    # Write data
+    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+            
+            # Format header row
+            if r_idx == 1:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+                cell.alignment = Alignment(horizontal="center")
+    
+    # Adjust column widths
+    column_widths = {
+        'A': 20,  # discrepancy_type
+        'B': 50,  # composite_key
+        'C': 25,  # column_name
+        'D': 40,  # source_value
+        'E': 40,  # target_value
+        'F': 60,  # full_source_row
+        'G': 60,  # full_target_row
+    }
+    for col, width in column_widths.items():
+        ws.column_dimensions[col].width = width
+    
+    # Freeze header row
+    ws.freeze_panes = "A2"
+    
+    # Add autofilter
+    ws.auto_filter.ref = ws.dimensions
+    
+    wb.save(output_file)
+    return output_file
+
+
+def _generate_xlsx_report(df: pd.DataFrame, base_output: str, total_rows: int, num_workers: Optional[int] = None) -> List[str]:
+    """
+    Generate XLSX report, splitting into multiple parts if necessary.
+    Uses parallel processing when multiple files are needed.
+    
+    Excel has a maximum of 1,048,576 rows (including header).
+    Each part file can contain up to 1,048,575 data rows.
+    
+    Args:
+        df: DataFrame with discrepancy data
+        base_output: Base output filename (without extension)
+        total_rows: Total number of rows
+        num_workers: Number of parallel workers (default: CPU count - 1)
+        
+    Returns:
+        List of output file paths
+    """
+    try:
+        from openpyxl import Workbook
+    except ImportError:
+        logger.error("[X] Error: openpyxl is required for XLSX output. Install with: pip install openpyxl")
+        raise
+    
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() - 1)
+    
+    XLSX_MAX_ROWS = 1_048_575  # Max data rows (excluding header)
+    output_files: List[str] = []
+    
+    num_parts = (total_rows + XLSX_MAX_ROWS - 1) // XLSX_MAX_ROWS  # Ceiling division
+    
+    if num_parts == 1:
+        logger.info("  Writing XLSX report...")
+        output_file = base_output + ".xlsx"
+        _write_xlsx_file_parallel((df, output_file, 1, 1))
+        output_files.append(output_file)
+    else:
+        logger.info(f"  Splitting report into {num_parts} XLSX files (Excel limit: {XLSX_MAX_ROWS:,} rows per file)...")
+        logger.info(f"  Writing {num_parts} files in parallel with {min(num_workers, num_parts)} workers...")
+        
+        # Prepare arguments for parallel processing
+        args_list = []
+        for part_num in range(num_parts):
+            start_idx = part_num * XLSX_MAX_ROWS
+            end_idx = min((part_num + 1) * XLSX_MAX_ROWS, total_rows)
+            chunk_df = df.iloc[start_idx:end_idx].copy()
+            output_file = f"{base_output}_part{part_num + 1}.xlsx"
+            args_list.append((chunk_df, output_file, part_num + 1, num_parts))
+        
+        # Write files in parallel
+        # executor.map preserves order - results come back in same order as args_list
+        with ProcessPoolExecutor(max_workers=min(num_workers, num_parts)) as executor:
+            output_files = list(executor.map(_write_xlsx_file_parallel, args_list))
+        
+        for i, f in enumerate(output_files, 1):
+            start_row = (i - 1) * XLSX_MAX_ROWS + 1
+            end_row = min(i * XLSX_MAX_ROWS, total_rows)
+            logger.info(f"    Part {i}/{num_parts}: rows {start_row:,} to {end_row:,} -> {os.path.basename(f)}")
+    
+    return output_files
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -1632,6 +1841,9 @@ def parse_arguments() -> argparse.Namespace:
                         help="Number of decimal places for numeric comparison (default: 6)")
     parser.add_argument("--esc-char", dest="escape_char", type=str, default=None,
                         help="Escape character for CSV parsing (e.g., --esc-char \"\\\\\" for backslash). Default: None")
+    parser.add_argument("--output-format", dest="output_format", type=str, default="xlsx",
+                        choices=["csv", "xlsx"],
+                        help="Output format: csv or xlsx (default: xlsx). XLSX files are split if exceeding 1M rows.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable verbose/debug logging")
 
@@ -1659,8 +1871,9 @@ def main() -> None:
         skip_normalisation = args.no_normalisation
         decimal_precision = args.decimal_precision
         escape_char = args.escape_char
+        output_format = args.output_format
     else:
-        logger.info("\nUsage: python csv_comparator.py <source_csv> <target_csv> [key_col1 key_col2 ...] [--output-dir DIR] [--no-normalisation] [--decimal-precision N] [--esc-char CHAR]")
+        logger.info("\nUsage: python csv_comparator.py <source_csv> <target_csv> [key_col1 key_col2 ...] [--output-dir DIR] [--no-normalisation] [--decimal-precision N] [--esc-char CHAR] [--output-format xlsx|csv]")
         logger.info("\nKey columns are optional - auto-detected if not provided.")
         source_file = input("Source (Hive) CSV path: ").strip()
         target_file = input("Target (Snowflake) CSV path: ").strip()
@@ -1670,6 +1883,7 @@ def main() -> None:
         skip_normalisation = False
         decimal_precision = DEFAULT_NUMERIC_PRECISION
         escape_char = None
+        output_format = "xlsx"
 
     for path, name in [(source_file, "Source"), (target_file, "Target")]:
         if not os.path.exists(path):
@@ -1684,6 +1898,7 @@ def main() -> None:
     logger.info(f"Normalisation: {'Disabled' if skip_normalisation else 'Enabled'}")
     logger.info(f"Decimal precision: {decimal_precision}")
     logger.info(f"Escape character: {repr(escape_char) if escape_char else 'None'}")
+    logger.info(f"Output format: {output_format.upper()}")
 
     logger.info("\n" + "-" * 40)
     logger.info("Loading files...")
@@ -1704,7 +1919,8 @@ def main() -> None:
         table_name = name_without_ext
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{table_name}_discrepancy_report_{timestamp}.csv"
+    # Use base filename without extension - generate_report will add correct extension
+    output_filename = f"{table_name}_discrepancy_report_{timestamp}"
 
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
@@ -1712,7 +1928,7 @@ def main() -> None:
     else:
         output_file = output_filename
 
-    generate_report(discrepancies, output_file, comparator.common_columns)
+    generate_report(discrepancies, output_file, comparator.common_columns, output_format=output_format)
 
     logger.info("\n" + "=" * 70)
     logger.info("Comparison Complete!")

@@ -13,7 +13,7 @@ High-performance CSV comparison tool for Hive to Snowflake data migration valida
 - **Duplicate detection** - Reports duplicate rows in source and target files
 - **Parallel processing** - Uses multiprocessing for large datasets (100k+ cells)
 - **Configurable escape character** - Optional escape character for CSV parsing
-- **Detailed reporting** - Generates CSV reports with full row context
+- **Detailed reporting** - Generates XLSX reports by default (CSV optional) with full row context
 
 ---
 
@@ -33,7 +33,11 @@ pip install -r requirements.txt
 Or simply:
 
 ```bash
+# Required
 pip install pandas
+
+# Optional (for XLSX output)
+pip install openpyxl
 ```
 
 ---
@@ -63,6 +67,7 @@ python csv_comparator.py source.csv target.csv ID TRADE_DATE ACCOUNT_ID
 | `--no-normalisation` | Disable value normalisation |
 | `--decimal-precision N` | Number of decimal places for numeric comparison (default: 6) |
 | `--esc-char CHAR` | Escape character for CSV parsing (default: None) |
+| `--output-format FORMAT` | Output format: `xlsx` or `csv` (default: xlsx) |
 | `-v, --verbose` | Enable verbose/debug logging |
 
 ### Examples
@@ -86,11 +91,17 @@ python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precisio
 # Use 2 decimal places for currency values
 python csv_comparator.py hive_export.csv snowflake_export.csv --decimal-precision 2
 
-# Use backslash as escape character (for CSV exports with backslash escaping)
+# Use backslash as escape character (for Hive exports with backslash escaping)
+# Windows (CMD/PowerShell):
+python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\"
+# Unix/Linux/macOS (Bash):
 python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\\"
 
 # Use tilde as escape character
 python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "~"
+
+# Generate report in CSV format (instead of default XLSX)
+python csv_comparator.py hive_export.csv snowflake_export.csv --output-format csv
 ```
 
 ### Interactive Mode
@@ -174,21 +185,31 @@ When rows are matched via fuzzy matching:
 
 The `--esc-char` option allows you to specify an escape character for CSV parsing. This is useful when:
 
-- CSV exports use backslash escaping (`\|`, `\n`, `\"`)
+- Hive exports use backslash escaping (`\|`, `\n`, `\"`)
 - CSV files contain special characters that need escaping
 - Different systems use different escape conventions
 
 **Default behaviour:** No escape character (None)
 
-```bash
-# For Hive exports with backslash escaping
-python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\\"
+**Windows (CMD/PowerShell):**
+```cmd
+REM Use backslash as escape character
+python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\"
 
-# For files using tilde as escape character
+REM Use tilde as escape character
 python csv_comparator.py source.csv target.csv --esc-char "~"
 ```
 
-**Note:** Only single-character escape values are supported.
+**Unix/Linux/macOS (Bash):**
+```bash
+# Use backslash as escape character
+python csv_comparator.py hive_export.csv snowflake_export.csv --esc-char "\\"
+
+# Use tilde as escape character
+python csv_comparator.py source.csv target.csv --esc-char "~"
+```
+
+**Note:** Only single-character escape values are supported. The backslash character requires different escaping depending on your shell - Windows shells pass `"\"` as a single backslash, whilst Unix shells require `"\\"` to produce a single backslash.
 
 ---
 
@@ -228,9 +249,37 @@ The tool displays:
 - Comparison progress
 - Summary of matches and discrepancies
 
+### Output Formats
+
+The tool supports two output formats:
+
+**XLSX (default)**
+- Formatted with headers, filters, and frozen panes
+- Excel row limit: 1,048,576 rows (including header)
+- **Automatic splitting**: Reports exceeding 1M rows are split into multiple files:
+  - `report_part1.xlsx` (rows 1 to 1,048,575)
+  - `report_part2.xlsx` (rows 1,048,576 to 2,097,150)
+  - etc.
+- Requires `openpyxl` library: `pip install openpyxl`
+
+**CSV**
+- No row limit
+- Compatible with all tools
+- Best for very large reports (> 1 million rows)
+
+```bash
+# Generate CSV report (instead of default XLSX)
+python csv_comparator.py source.csv target.csv --output-format csv
+
+# Example XLSX output for large reports:
+#   report_part1.xlsx (1,048,575 rows)
+#   report_part2.xlsx (1,048,575 rows)
+#   report_part3.xlsx (remaining rows)
+```
+
 ### Discrepancy Report
 
-A CSV report is generated with the following columns:
+A report is generated with the following columns:
 
 | Column | Description |
 |--------|-------------|
@@ -395,13 +444,23 @@ For very large files (millions of rows), consider:
 
 ### Escape Character Errors
 
-If you see `Only length-1 escapes supported`, ensure you're passing a single character to `--esc-char`:
+If you see `Only length-1 escapes supported`, you're passing more than one character to `--esc-char`. This commonly happens due to shell escaping differences:
 
+**Windows (CMD/PowerShell):**
+```cmd
+REM Correct - Windows passes this as a single backslash
+python csv_comparator.py source.csv target.csv --esc-char "\"
+
+REM Incorrect - Windows passes this as two backslashes
+python csv_comparator.py source.csv target.csv --esc-char "\\"
+```
+
+**Unix/Linux/macOS (Bash):**
 ```bash
-# Correct
+# Correct - Bash interprets \\ as a single backslash
 python csv_comparator.py source.csv target.csv --esc-char "\\"
 
-# Incorrect (double escaped)
+# Incorrect - Bash interprets \\\\ as two backslashes
 python csv_comparator.py source.csv target.csv --esc-char "\\\\"
 ```
 
@@ -420,9 +479,13 @@ If you see many `MISSING_IN_SOURCE` and `MISSING_IN_TARGET` discrepancies:
 
 ### Latest Version
 
+- Added `--output-format` option for XLSX output with automatic splitting for large reports
 - Added `--esc-char` option for configurable escape character (default: None)
 - Added fuzzy key matching for rows with similar keys
 - Added `KEY_VALUE_MISMATCH` discrepancy type for fuzzy-matched rows
+- Added ETL metadata column exclusions (EDD_*, ETL_*, UUID, GUID, EXTRACT_*)
+- Added parallel processing for identifying rows only in target
+- Fixed quoted CSV handling to preserve properly quoted fields
 - Increased composite key limits: max 30 columns, search up to 25 combinations, fallback to 20
 - Improved test coverage with 38 integration tests and 130+ unit tests
 

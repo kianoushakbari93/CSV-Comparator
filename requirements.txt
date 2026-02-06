@@ -3,6 +3,7 @@
 
 # Required
 pandas>=1.5.0
+openpyxl
 
 # Optional - for better test output formatting
 # Uncomment if you want to use pytest
