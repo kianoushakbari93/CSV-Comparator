@@ -148,12 +148,19 @@ def normalise_value(
     # Normalise numeric formatting (only for pure numeric values)
     try:
         clean_num = stripped.replace(',', '')
-        float_val = float(clean_num)
-        if str_value.strip() == str_value:
-            if float_val.is_integer():
-                return str(int(float_val))
-            # Round to specified decimal places for consistent comparison
-            return str(round(float_val, numeric_precision))
+        # Handle pure integers without float conversion to preserve precision
+        # for large values beyond float64 range (> 2^53)
+        if re.match(r'^[+-]?\d+$', clean_num):
+            int_val = int(clean_num)
+            if str_value.strip() == str_value:
+                return str(int_val)
+        else:
+            float_val = float(clean_num)
+            if str_value.strip() == str_value:
+                if float_val.is_integer():
+                    return str(int(float_val))
+                # Round to specified decimal places for consistent comparison
+                return str(round(float_val, numeric_precision))
     except (ValueError, TypeError):
         pass
 
@@ -837,8 +844,10 @@ def _compute_row_hash(
     normalised = []
     for v in row_values:
         norm_v = normalise_value(v, skip_norm, numeric_precision=decimal_prec)
-        normalised.append(str(norm_v) if norm_v is not None else 'NULL')
-    return hashlib.sha256('|'.join(normalised).encode()).hexdigest()[:32]
+        # Lowercase for case-insensitive hashing (matches comparison behaviour)
+        normalised.append(str(norm_v).lower() if norm_v is not None else '\x01NULL')
+    # Use null-byte separator to prevent collisions when cell values contain pipes
+    return hashlib.sha256('\x00'.join(normalised).encode()).hexdigest()[:32]
 
 
 def normalise_chunk_parallel(
@@ -908,65 +917,160 @@ def detect_duplicates_hash_chunk(
     return list(zip(chunk_df.index.tolist(), hashes.tolist()))
 
 
+def _build_composite_key(row: pd.Series, key_cols: List[str]) -> str:
+    """
+    Build a composite key string from a row's key column values.
+    Uses pd.isna() for consistent null handling across None and NaN.
+
+    Args:
+        row: DataFrame row
+        key_cols: List of key column names
+
+    Returns:
+        Composite key string
+    """
+    return '||'.join([
+        f"{c}={str(row[c]) if not pd.isna(row[c]) else 'NULL'}"
+        for c in key_cols
+    ])
+
+
+def _build_full_row_string(row: pd.Series, cols: List[str]) -> str:
+    """
+    Build a pipe-delimited string of all column values from a row.
+
+    Args:
+        row: DataFrame row
+        cols: List of column names
+
+    Returns:
+        Pipe-delimited string of values
+    """
+    return '|'.join([
+        str(row[c]) if not pd.isna(row[c]) else 'NULL'
+        for c in cols
+    ])
+
+
+def _count_matching_columns(
+    src_row: pd.Series,
+    tgt_row: pd.Series,
+    compare_cols: List[str],
+    key_cols: List[str]
+) -> int:
+    """
+    Count how many non-key columns match between source and target rows.
+    Used to select the best target candidate when duplicate keys exist.
+    Data is assumed to be already normalised.
+
+    Args:
+        src_row: Source row (normalised)
+        tgt_row: Target row (normalised)
+        compare_cols: All columns to compare
+        key_cols: Key columns (excluded from scoring)
+
+    Returns:
+        Number of matching non-key columns
+    """
+    matches = 0
+    for col in compare_cols:
+        if col in key_cols:
+            continue
+        src_val = src_row[col]
+        tgt_val = tgt_row[col]
+        src_is_null = pd.isna(src_val) or src_val is None
+        tgt_is_null = pd.isna(tgt_val) or tgt_val is None
+        if src_is_null and tgt_is_null:
+            matches += 1
+        elif src_is_null or tgt_is_null:
+            continue
+        elif str(src_val) == str(tgt_val) or str(src_val).lower() == str(tgt_val).lower():
+            matches += 1
+    return matches
+
+
 def compare_rows_parallel(
-    args: Tuple[pd.DataFrame, Dict[str, List[Any]], Dict[str, List[Any]], pd.DataFrame, List[str], List[str], bool, int]
+    args: Tuple
 ) -> Tuple[List[Dict[str, Any]], Set[Any]]:
     """
     Compare a chunk of source rows against target using deep comparison.
-    Supports both exact and fuzzy key matching.
-    Used for parallel processing.
+    Supports both exact and fuzzy key matching with best-match selection
+    when multiple target candidates share the same key.
+
+    Data is assumed to be already normalised (Step 2); no re-normalisation
+    is performed here to avoid redundancy and ensure consistency.
 
     Args:
-        args: Tuple of (source_chunk, target_key_to_indices, target_fuzzy_key_to_indices,
-              target_df, compare_cols, key_cols, skip_normalisation, decimal_precision)
+        args: Tuple of (source_chunk, source_chunk_original,
+              target_key_to_indices, target_fuzzy_key_to_indices,
+              target_df, target_df_original, compare_cols, key_cols,
+              skip_normalisation, decimal_precision)
 
     Returns:
         Tuple of (discrepancies list, matched_target_indices set)
     """
-    (source_chunk, target_key_to_indices, target_fuzzy_key_to_indices,
-     target_df, compare_cols, key_cols, skip_normalisation, decimal_prec) = args
+    (source_chunk, source_chunk_original,
+     target_key_to_indices, target_fuzzy_key_to_indices,
+     target_df, target_df_original,
+     compare_cols, key_cols,
+     skip_normalisation, decimal_prec) = args
 
     discrepancies: List[Dict[str, Any]] = []
     matched_target_indices: Set[Any] = set()
 
     for src_idx, src_row in source_chunk.iterrows():
-        # Cache normalised values for all columns in source row
-        src_normalised = {col: normalise_value(src_row[col], skip_normalisation, numeric_precision=decimal_prec) for col in compare_cols}
-        
-        # Build composite key using cached values
-        src_key = '||'.join([
-            f"{c}={str(src_normalised[c]) if src_normalised[c] is not None else 'NULL'}"
-            for c in key_cols
-        ])
+        src_row_original = source_chunk_original.loc[src_idx]
+
+        # Build composite key from already-normalised values
+        src_key = _build_composite_key(src_row, key_cols)
         
         matched_tgt_idx = None
         is_fuzzy_match = False
-        fuzzy_key_differences = []
+        fuzzy_key_differences: List[Dict[str, str]] = []
         
-        # Step 1: Try exact key match first
+        # Step 1: Try exact key match first, selecting best candidate
         if src_key in target_key_to_indices:
-            target_indices = target_key_to_indices[src_key]
-            for tgt_idx in target_indices:
-                if tgt_idx not in matched_target_indices:
-                    matched_tgt_idx = tgt_idx
-                    break
+            target_indices = [
+                idx for idx in target_key_to_indices[src_key]
+                if idx not in matched_target_indices
+            ]
+            if len(target_indices) == 1:
+                matched_tgt_idx = target_indices[0]
+            elif len(target_indices) > 1:
+                # Score each candidate by how many non-key columns match,
+                # then pick the one with the fewest differences
+                best_idx = None
+                best_score = -1
+                for tgt_idx in target_indices:
+                    score = _count_matching_columns(
+                        src_row, target_df.loc[tgt_idx], compare_cols, key_cols
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best_idx = tgt_idx
+                matched_tgt_idx = best_idx
         
         # Step 2: If no exact match, try fuzzy key match
         if matched_tgt_idx is None and target_fuzzy_key_to_indices:
             src_fuzzy_key = build_fuzzy_key(src_row, key_cols)
             
             if src_fuzzy_key in target_fuzzy_key_to_indices:
-                fuzzy_candidates = target_fuzzy_key_to_indices[src_fuzzy_key]
+                fuzzy_candidates = [
+                    idx for idx in target_fuzzy_key_to_indices[src_fuzzy_key]
+                    if idx not in matched_target_indices
+                ]
+                
+                # Score fuzzy candidates too for best-match selection
+                best_fuzzy_idx = None
+                best_fuzzy_score = -1
+                best_fuzzy_diffs: List[Dict[str, str]] = []
                 
                 for tgt_idx in fuzzy_candidates:
-                    if tgt_idx in matched_target_indices:
-                        continue
-                    
                     tgt_row = target_df.loc[tgt_idx]
                     
                     # Check if ALL key columns are fuzzy-similar
                     all_keys_similar = True
-                    temp_key_diffs = []
+                    temp_key_diffs: List[Dict[str, str]] = []
                     
                     for col in key_cols:
                         src_val = src_row[col]
@@ -991,19 +1095,25 @@ def compare_rows_parallel(
                             })
                     
                     if all_keys_similar:
-                        matched_tgt_idx = tgt_idx
-                        is_fuzzy_match = True
-                        fuzzy_key_differences = temp_key_diffs
-                        break
+                        score = _count_matching_columns(
+                            src_row, tgt_row, compare_cols, key_cols
+                        )
+                        if score > best_fuzzy_score:
+                            best_fuzzy_score = score
+                            best_fuzzy_idx = tgt_idx
+                            best_fuzzy_diffs = temp_key_diffs
+                
+                if best_fuzzy_idx is not None:
+                    matched_tgt_idx = best_fuzzy_idx
+                    is_fuzzy_match = True
+                    fuzzy_key_differences = best_fuzzy_diffs
         
         # Step 3: If match found (exact or fuzzy), compare all values
         if matched_tgt_idx is not None:
             matched_target_indices.add(matched_tgt_idx)
             tgt_row = target_df.loc[matched_tgt_idx]
+            tgt_row_original = target_df_original.loc[matched_tgt_idx]
 
-            # Cache normalised values for target row
-            tgt_normalised = {col: normalise_value(tgt_row[col], skip_normalisation, numeric_precision=decimal_prec) for col in compare_cols}
-            
             differences = []
             
             # First add key column differences from fuzzy matching
@@ -1022,41 +1132,40 @@ def compare_rows_parallel(
             for col in compare_cols:
                 if col in reported_key_cols:
                     continue
-                    
-                norm_src = src_normalised[col]
-                norm_tgt = tgt_normalised[col]
                 
-                # Compare using cached normalised values
-                values_equal = (norm_src == norm_tgt) or (
-                    not skip_normalisation and 
-                    norm_src is not None and 
-                    norm_tgt is not None and 
-                    norm_src.lower() == norm_tgt.lower()
-                )
+                norm_src = src_row[col]
+                norm_tgt = tgt_row[col]
+                
+                # Compare using already-normalised values (case-insensitive)
+                src_is_null = pd.isna(norm_src) or norm_src is None
+                tgt_is_null = pd.isna(norm_tgt) or norm_tgt is None
+                
+                if src_is_null and tgt_is_null:
+                    continue
+                
+                if src_is_null or tgt_is_null:
+                    values_equal = False
+                else:
+                    values_equal = (str(norm_src) == str(norm_tgt)) or (
+                        not skip_normalisation and
+                        str(norm_src).lower() == str(norm_tgt).lower()
+                    )
                 
                 if not values_equal:
                     differences.append({
                         'column': col,
-                        'source': str(norm_src) if norm_src is not None else 'NULL',
-                        'target': str(norm_tgt) if norm_tgt is not None else 'NULL',
+                        'source': str(norm_src) if not src_is_null else 'NULL',
+                        'target': str(norm_tgt) if not tgt_is_null else 'NULL',
                         'is_key_column': col in key_cols
                     })
             
             if differences:
-                full_source_row = '|'.join([
-                    str(src_row[c]) if src_row[c] is not None else 'NULL' 
-                    for c in compare_cols
-                ])
-                full_target_row = '|'.join([
-                    str(tgt_row[c]) if tgt_row[c] is not None else 'NULL' 
-                    for c in compare_cols
-                ])
+                # Use original (pre-normalisation) values for full row output
+                full_source_row = _build_full_row_string(src_row_original, compare_cols)
+                full_target_row = _build_full_row_string(tgt_row_original, compare_cols)
                 
                 # Build the target key for reporting
-                tgt_key = '||'.join([
-                    f"{c}={str(tgt_normalised[c]) if tgt_normalised[c] is not None else 'NULL'}"
-                    for c in key_cols
-                ])
+                tgt_key = _build_composite_key(tgt_row, key_cols)
                 
                 for diff in differences:
                     # Use KEY_VALUE_MISMATCH for key column differences, VALUE_MISMATCH for others
@@ -1073,11 +1182,8 @@ def compare_rows_parallel(
                     })
             continue
         
-        # Step 4: No match found - report as missing
-        full_row_data = '|'.join([
-            str(src_row[c]) if src_row[c] is not None else 'NULL' 
-            for c in compare_cols
-        ])
+        # Step 4: No match found - report as missing (use original values)
+        full_row_data = _build_full_row_string(src_row_original, compare_cols)
         discrepancies.append({
             'discrepancy_type': 'MISSING_IN_TARGET',
             'composite_key': src_key,
@@ -1092,31 +1198,27 @@ def compare_rows_parallel(
 
 
 def identify_missing_in_source_parallel(
-    args: Tuple[List[Any], pd.DataFrame, List[str], List[str]]
+    args: Tuple[List[Any], pd.DataFrame, pd.DataFrame, List[str], List[str]]
 ) -> List[Dict[str, Any]]:
     """
     Identify rows that exist in target but not in source (MISSING_IN_SOURCE).
     Used for parallel processing.
 
     Args:
-        args: Tuple of (unmatched_indices, target_df, compare_cols, key_cols)
+        args: Tuple of (unmatched_indices, target_df, target_df_original,
+              compare_cols, key_cols)
 
     Returns:
         List of discrepancy dictionaries
     """
-    unmatched_indices, target_df, compare_cols, key_cols = args
+    unmatched_indices, target_df, target_df_original, compare_cols, key_cols = args
     discrepancies: List[Dict[str, Any]] = []
 
     for tgt_idx in unmatched_indices:
         tgt_row = target_df.loc[tgt_idx]
-        key = '||'.join([
-            f"{c}={str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'}"
-            for c in key_cols
-        ])
-        full_row_data = '|'.join([
-            str(tgt_row[c]) if tgt_row[c] is not None else 'NULL'
-            for c in compare_cols
-        ])
+        tgt_row_original = target_df_original.loc[tgt_idx]
+        key = _build_composite_key(tgt_row, key_cols)
+        full_row_data = _build_full_row_string(tgt_row_original, compare_cols)
         discrepancies.append({
             'discrepancy_type': 'MISSING_IN_SOURCE',
             'composite_key': key,
@@ -1281,6 +1383,9 @@ class HighPerformanceComparator:
         self._align_columns()
 
         logger.info("\nStep 2: Normalising data...")
+        # Preserve originals for diagnostic output in reports
+        source_df_original = self.source_df.copy()
+        target_df_original = self.target_df.copy()
         self.source_df = self._normalise_dataframe(self.source_df, "source")
         self.target_df = self._normalise_dataframe(self.target_df, "target")
 
@@ -1316,7 +1421,9 @@ class HighPerformanceComparator:
                     'composite_key': f'HASH:{h[:16]}',
                     'column_name': 'ALL',
                     'source_value': f'{len(src_indices)} occurrences',
-                    'target_value': f'{len(tgt_indices)} occurrences'
+                    'target_value': f'{len(tgt_indices)} occurrences',
+                    'full_source_row': 'N/A',
+                    'full_target_row': 'N/A'
                 })
 
         logger.info(f"  [OK] Exact matches: {len(source_matched):,} rows")
@@ -1334,6 +1441,10 @@ class HighPerformanceComparator:
 
         source_unmatched = self.source_df.loc[source_unmatched_idx].drop(columns=['_ROW_HASH_']).copy()
         target_unmatched = self.target_df.loc[target_unmatched_idx].drop(columns=['_ROW_HASH_']).copy()
+
+        # Original (pre-normalisation) values for diagnostic report output
+        source_unmatched_original = source_df_original.loc[source_unmatched_idx].copy()
+        target_unmatched_original = target_df_original.loc[target_unmatched_idx].copy()
 
         if self.key_columns:
             key_cols = [c.upper() for c in self.key_columns if c.upper() in self.common_columns]
@@ -1353,9 +1464,9 @@ class HighPerformanceComparator:
         target_fuzzy_key_to_indices: DefaultDict[str, List[Any]] = defaultdict(list)
 
         for idx, row in target_unmatched.iterrows():
-            # Build exact key
+            # Build exact key (use pd.isna for consistent null handling)
             key = '||'.join([
-                f"{c}={str(row[c]) if row[c] is not None else 'NULL'}"
+                f"{c}={str(row[c]) if not pd.isna(row[c]) else 'NULL'}"
                 for c in key_cols
             ])
             target_key_to_indices[key].append(idx)
@@ -1371,7 +1482,12 @@ class HighPerformanceComparator:
         logger.info(f"  Built {len(target_key_to_indices):,} exact keys, {len(target_fuzzy_key_to_indices):,} fuzzy keys")
 
         logger.info("  Running parallel deep comparison (with fuzzy key matching)...")
-        self._parallel_deep_comparison(source_unmatched, target_unmatched, target_key_to_indices, target_fuzzy_key_to_indices, compare_cols, key_cols)
+        self._parallel_deep_comparison(
+            source_unmatched, target_unmatched,
+            source_unmatched_original, target_unmatched_original,
+            target_key_to_indices, target_fuzzy_key_to_indices,
+            compare_cols, key_cols
+        )
 
         return self.discrepancies
 
@@ -1463,6 +1579,8 @@ class HighPerformanceComparator:
         self,
         source_df: pd.DataFrame,
         target_df: pd.DataFrame,
+        source_df_original: pd.DataFrame,
+        target_df_original: pd.DataFrame,
         target_key_to_indices: Dict[str, List[Any]],
         target_fuzzy_key_to_indices: Dict[str, List[Any]],
         compare_cols: List[str],
@@ -1473,8 +1591,10 @@ class HighPerformanceComparator:
         Supports both exact and fuzzy key matching.
 
         Args:
-            source_df: Source DataFrame (unmatched rows only)
-            target_df: Target DataFrame (unmatched rows only)
+            source_df: Source DataFrame (normalised, unmatched rows only)
+            target_df: Target DataFrame (normalised, unmatched rows only)
+            source_df_original: Original source DataFrame (pre-normalisation)
+            target_df_original: Original target DataFrame (pre-normalisation)
             target_key_to_indices: Mapping of exact composite keys to target row indices
             target_fuzzy_key_to_indices: Mapping of fuzzy keys to target row indices
             compare_cols: Columns to compare
@@ -1486,6 +1606,7 @@ class HighPerformanceComparator:
 
         chunk_size = max(500, len(source_df) // (self.num_workers * 8))
         chunks = [source_df.iloc[i:i + chunk_size] for i in range(0, len(source_df), chunk_size)]
+        original_chunks = [source_df_original.iloc[i:i + chunk_size] for i in range(0, len(source_df_original), chunk_size)]
 
         logger.info(f"  Processing {len(chunks)} chunks with {self.num_workers} workers...")
 
@@ -1497,12 +1618,30 @@ class HighPerformanceComparator:
         target_fuzzy_key_dict = dict(target_fuzzy_key_to_indices)
 
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for chunk in chunks:
-                args = (chunk, target_key_dict, target_fuzzy_key_dict, target_df, compare_cols, key_cols, self.skip_normalisation, self.decimal_precision)
-                futures.append(executor.submit(compare_rows_parallel, args))
+            for chunk, original_chunk in zip(chunks, original_chunks):
+                # Filter target indices to exclude already-matched rows before each chunk.
+                # This prevents the race condition where multiple chunks independently
+                # match the same target row when duplicate source keys span chunks.
+                filtered_target_keys = {
+                    k: [idx for idx in v if idx not in all_matched_target_indices]
+                    for k, v in target_key_dict.items()
+                }
+                filtered_target_keys = {k: v for k, v in filtered_target_keys.items() if v}
 
-            for future in as_completed(futures):
+                filtered_fuzzy_keys = {
+                    k: [idx for idx in v if idx not in all_matched_target_indices]
+                    for k, v in target_fuzzy_key_dict.items()
+                }
+                filtered_fuzzy_keys = {k: v for k, v in filtered_fuzzy_keys.items() if v}
+
+                args = (
+                    chunk, original_chunk,
+                    filtered_target_keys, filtered_fuzzy_keys,
+                    target_df, target_df_original,
+                    compare_cols, key_cols,
+                    self.skip_normalisation, self.decimal_precision
+                )
+                future = executor.submit(compare_rows_parallel, args)
                 chunk_discrepancies, matched_indices = future.result()
                 self.discrepancies.extend(chunk_discrepancies)
                 all_matched_target_indices.update(matched_indices)
@@ -1529,7 +1668,7 @@ class HighPerformanceComparator:
             with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
                 futures = []
                 for chunk in unmatched_chunks:
-                    args = (chunk, target_df, compare_cols, key_cols)
+                    args = (chunk, target_df, target_df_original, compare_cols, key_cols)
                     futures.append(executor.submit(identify_missing_in_source_parallel, args))
                 
                 for future in as_completed(futures):
