@@ -1,0 +1,27 @@
+# Generated discrepancy reports
+*_discrepancy_report_*.xlsx
+*_discrepancy_report_*.csv
+*_column_reference.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp files
+*.tmp
+cleaned_*.csv

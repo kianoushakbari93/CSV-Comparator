@@ -29,6 +29,10 @@ from contextlib import contextmanager
 from typing import Any, Optional, Dict, List, Tuple, Set, DefaultDict
 
 
+class CSVComparatorError(Exception):
+    """Raised when the CSV comparator encounters a fatal error (e.g. file load failure)."""
+
+
 # =============================================================================
 # LOGGING CONFIGURATION
 # =============================================================================
@@ -298,14 +302,28 @@ def build_fuzzy_key(row: pd.Series, key_cols: List[str]) -> str:
 
 def detect_delimiter_for_line(line: str) -> str:
     """Detect the most likely delimiter for a single line."""
+    # Count occurrences of each candidate delimiter
     delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
     for delim in delimiters:
         delimiters[delim] = line.count(delim)
 
-    best_delim = max(delimiters, key=delimiters.get)
-    if delimiters[best_delim] == 0:
+    best_count_delim = max(delimiters, key=delimiters.get)
+
+    # Try csv.Sniffer for robust detection (handles quoted fields correctly)
+    try:
+        dialect = csv.Sniffer().sniff(line, delimiters='|,\t~;')
+        sniffed = dialect.delimiter
+        # Use Sniffer result only if it agrees with counting or counting is ambiguous
+        if sniffed == best_count_delim or delimiters[best_count_delim] == 0:
+            return sniffed
+        # If Sniffer disagrees with clear counting winner, prefer counting
+        # (Sniffer can be fooled by data containing commas in pipe-delimited files)
+    except csv.Error:
+        pass
+
+    if delimiters[best_count_delim] == 0:
         return ','
-    return best_delim
+    return best_count_delim
 
 
 def detect_delimiters(filepath: str, sample_lines: int = 10) -> Tuple[str, str]:
@@ -339,14 +357,30 @@ def detect_delimiters(filepath: str, sample_lines: int = 10) -> Tuple[str, str]:
         if not data_lines:
             return header_delim, header_delim
 
-        delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
-        for line in data_lines:
-            for delim in delimiters:
-                delimiters[delim] += line.count(delim)
+        # Try csv.Sniffer on concatenated data lines first
+        row_delim = None
+        header_col_count = len(list(csv.reader([header_line], delimiter=header_delim))[0])
+        try:
+            sample_data = '\n'.join(data_lines)
+            dialect = csv.Sniffer().sniff(sample_data, delimiters='|,\t~;')
+            # Validate: Sniffer result should produce consistent column counts with header
+            sniffed = dialect.delimiter
+            sniffed_counts = [len(list(csv.reader([dl], delimiter=sniffed))[0]) for dl in data_lines]
+            if all(c == header_col_count for c in sniffed_counts):
+                row_delim = sniffed
+        except csv.Error:
+            pass
 
-        row_delim = max(delimiters, key=delimiters.get)
-        if delimiters[row_delim] == 0:
-            row_delim = header_delim
+        # Fallback: counting logic
+        if row_delim is None:
+            delimiters: Dict[str, int] = {'|': 0, ',': 0, '\t': 0, '~': 0, ';': 0}
+            for line in data_lines:
+                for delim in delimiters:
+                    delimiters[delim] += line.count(delim)
+
+            row_delim = max(delimiters, key=delimiters.get)
+            if delimiters[row_delim] == 0:
+                row_delim = header_delim
 
         return header_delim, row_delim
 
@@ -491,14 +525,12 @@ def load_csv_file(filepath: str, source_name: str, escape_char: Optional[str] = 
             if header_delim != row_delim:
                 df = load_mixed_delimiter_csv(cleaned_filepath, header_delim, row_delim)
             else:
-                quoting_mode = csv.QUOTE_NONE if rows_fixed > 0 else csv.QUOTE_MINIMAL
-
                 df = pd.read_csv(
                     cleaned_filepath,
                     sep=header_delim,
                     dtype=str,
                     keep_default_na=False,
-                    quoting=quoting_mode,
+                    quoting=csv.QUOTE_MINIMAL,
                     skipinitialspace=True,
                     on_bad_lines='warn',
                     engine='c',
@@ -518,7 +550,7 @@ def load_csv_file(filepath: str, source_name: str, escape_char: Optional[str] = 
 
         except Exception as e:
             logger.error(f"  [X] Error loading {source_name}: {e}")
-            sys.exit(1)
+            raise CSVComparatorError(f"Error loading {source_name}: {e}") from e
 
 
 def load_mixed_delimiter_csv(filepath: str, header_delim: str, row_delim: str) -> pd.DataFrame:
@@ -535,14 +567,14 @@ def load_mixed_delimiter_csv(filepath: str, header_delim: str, row_delim: str) -
     """
     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
         header_line = f.readline().strip()
-        column_names = [col.strip().upper() for col in header_line.split(header_delim)]
+        column_names = [col.strip().upper() for col in next(csv.reader([header_line], delimiter=header_delim))]
 
         data_rows: List[List[str]] = []
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            row_values = line.split(row_delim)
+            row_values = next(csv.reader([line], delimiter=row_delim))
             data_rows.append(row_values)
 
     df = pd.DataFrame(data_rows)
@@ -991,7 +1023,7 @@ def _count_matching_columns(
 
 def compare_rows_parallel(
     args: Tuple
-) -> Tuple[List[Dict[str, Any]], Set[Any]]:
+) -> Tuple[Dict[Any, List[Dict[str, Any]]], Set[Any], Dict[Any, Any]]:
     """
     Compare a chunk of source rows against target using deep comparison.
     Supports both exact and fuzzy key matching with best-match selection
@@ -1000,34 +1032,40 @@ def compare_rows_parallel(
     Data is assumed to be already normalised (Step 2); no re-normalisation
     is performed here to avoid redundancy and ensure consistency.
 
+    Target data is passed as dicts (from DataFrame.to_dict('index')) for
+    efficient pickling across process boundaries.
+
     Args:
         args: Tuple of (source_chunk, source_chunk_original,
               target_key_to_indices, target_fuzzy_key_to_indices,
-              target_df, target_df_original, compare_cols, key_cols,
+              target_dict, target_dict_original, compare_cols, key_cols,
               skip_normalisation, decimal_precision)
 
     Returns:
-        Tuple of (discrepancies list, matched_target_indices set)
+        Tuple of (per_source_discrepancies dict mapping src_idx -> discrepancies,
+                  matched_target_indices set,
+                  source_to_target mapping dict)
     """
     (source_chunk, source_chunk_original,
      target_key_to_indices, target_fuzzy_key_to_indices,
-     target_df, target_df_original,
+     target_dict, target_dict_original,
      compare_cols, key_cols,
      skip_normalisation, decimal_prec) = args
 
-    discrepancies: List[Dict[str, Any]] = []
+    per_source: Dict[Any, List[Dict[str, Any]]] = {}
     matched_target_indices: Set[Any] = set()
+    source_to_target: Dict[Any, Any] = {}
 
     for src_idx, src_row in source_chunk.iterrows():
         src_row_original = source_chunk_original.loc[src_idx]
 
         # Build composite key from already-normalised values
         src_key = _build_composite_key(src_row, key_cols)
-        
+
         matched_tgt_idx = None
         is_fuzzy_match = False
         fuzzy_key_differences: List[Dict[str, str]] = []
-        
+
         # Step 1: Try exact key match first, selecting best candidate
         if src_key in target_key_to_indices:
             target_indices = [
@@ -1043,46 +1081,46 @@ def compare_rows_parallel(
                 best_score = -1
                 for tgt_idx in target_indices:
                     score = _count_matching_columns(
-                        src_row, target_df.loc[tgt_idx], compare_cols, key_cols
+                        src_row, target_dict[tgt_idx], compare_cols, key_cols
                     )
                     if score > best_score:
                         best_score = score
                         best_idx = tgt_idx
                 matched_tgt_idx = best_idx
-        
+
         # Step 2: If no exact match, try fuzzy key match
         if matched_tgt_idx is None and target_fuzzy_key_to_indices:
             src_fuzzy_key = build_fuzzy_key(src_row, key_cols)
-            
+
             if src_fuzzy_key in target_fuzzy_key_to_indices:
                 fuzzy_candidates = [
                     idx for idx in target_fuzzy_key_to_indices[src_fuzzy_key]
                     if idx not in matched_target_indices
                 ]
-                
+
                 # Score fuzzy candidates too for best-match selection
                 best_fuzzy_idx = None
                 best_fuzzy_score = -1
                 best_fuzzy_diffs: List[Dict[str, str]] = []
-                
+
                 for tgt_idx in fuzzy_candidates:
-                    tgt_row = target_df.loc[tgt_idx]
-                    
+                    tgt_row = target_dict[tgt_idx]
+
                     # Check if ALL key columns are fuzzy-similar
                     all_keys_similar = True
                     temp_key_diffs: List[Dict[str, str]] = []
-                    
+
                     for col in key_cols:
                         src_val = src_row[col]
                         tgt_val = tgt_row[col]
                         is_similar, match_type = key_values_fuzzy_equal(
                             src_val, tgt_val, skip_normalisation, decimal_prec
                         )
-                        
+
                         if not is_similar:
                             all_keys_similar = False
                             break
-                        
+
                         # Track key differences for reporting (even fuzzy matches)
                         if match_type != 'EXACT':
                             src_norm = normalise_value(src_val, skip_normalisation, numeric_precision=decimal_prec)
@@ -1093,7 +1131,7 @@ def compare_rows_parallel(
                                 'target': str(tgt_norm) if tgt_norm is not None else 'NULL',
                                 'match_type': match_type
                             })
-                    
+
                     if all_keys_similar:
                         score = _count_matching_columns(
                             src_row, tgt_row, compare_cols, key_cols
@@ -1102,20 +1140,21 @@ def compare_rows_parallel(
                             best_fuzzy_score = score
                             best_fuzzy_idx = tgt_idx
                             best_fuzzy_diffs = temp_key_diffs
-                
+
                 if best_fuzzy_idx is not None:
                     matched_tgt_idx = best_fuzzy_idx
                     is_fuzzy_match = True
                     fuzzy_key_differences = best_fuzzy_diffs
-        
+
         # Step 3: If match found (exact or fuzzy), compare all values
         if matched_tgt_idx is not None:
             matched_target_indices.add(matched_tgt_idx)
-            tgt_row = target_df.loc[matched_tgt_idx]
-            tgt_row_original = target_df_original.loc[matched_tgt_idx]
+            source_to_target[src_idx] = matched_tgt_idx
+            tgt_row = target_dict[matched_tgt_idx]
+            tgt_row_original = target_dict_original[matched_tgt_idx]
 
             differences = []
-            
+
             # First add key column differences from fuzzy matching
             if is_fuzzy_match and fuzzy_key_differences:
                 for key_diff in fuzzy_key_differences:
@@ -1125,24 +1164,24 @@ def compare_rows_parallel(
                         'target': key_diff['target'],
                         'is_key_column': True
                     })
-            
+
             # Then compare all columns (skip key columns already reported)
             reported_key_cols = {d['column'] for d in fuzzy_key_differences} if fuzzy_key_differences else set()
-            
+
             for col in compare_cols:
                 if col in reported_key_cols:
                     continue
-                
+
                 norm_src = src_row[col]
                 norm_tgt = tgt_row[col]
-                
+
                 # Compare using already-normalised values (case-insensitive)
                 src_is_null = pd.isna(norm_src) or norm_src is None
                 tgt_is_null = pd.isna(norm_tgt) or norm_tgt is None
-                
+
                 if src_is_null and tgt_is_null:
                     continue
-                
+
                 if src_is_null or tgt_is_null:
                     values_equal = False
                 else:
@@ -1150,7 +1189,7 @@ def compare_rows_parallel(
                         not skip_normalisation and
                         str(norm_src).lower() == str(norm_tgt).lower()
                     )
-                
+
                 if not values_equal:
                     differences.append({
                         'column': col,
@@ -1158,20 +1197,21 @@ def compare_rows_parallel(
                         'target': str(norm_tgt) if not tgt_is_null else 'NULL',
                         'is_key_column': col in key_cols
                     })
-            
+
             if differences:
                 # Use original (pre-normalisation) values for full row output
                 full_source_row = _build_full_row_string(src_row_original, compare_cols)
                 full_target_row = _build_full_row_string(tgt_row_original, compare_cols)
-                
+
                 # Build the target key for reporting
                 tgt_key = _build_composite_key(tgt_row, key_cols)
-                
+
+                src_discs = []
                 for diff in differences:
                     # Use KEY_VALUE_MISMATCH for key column differences, VALUE_MISMATCH for others
                     disc_type = 'KEY_VALUE_MISMATCH' if diff.get('is_key_column') else 'VALUE_MISMATCH'
-                    
-                    discrepancies.append({
+
+                    src_discs.append({
                         'discrepancy_type': disc_type,
                         'composite_key': f"{src_key} ~> {tgt_key}" if is_fuzzy_match else src_key,
                         'column_name': diff['column'],
@@ -1180,11 +1220,12 @@ def compare_rows_parallel(
                         'full_source_row': full_source_row,
                         'full_target_row': full_target_row
                     })
+                per_source[src_idx] = src_discs
             continue
-        
+
         # Step 4: No match found - report as missing (use original values)
         full_row_data = _build_full_row_string(src_row_original, compare_cols)
-        discrepancies.append({
+        per_source[src_idx] = [{
             'discrepancy_type': 'MISSING_IN_TARGET',
             'composite_key': src_key,
             'column_name': 'ALL',
@@ -1192,31 +1233,36 @@ def compare_rows_parallel(
             'target_value': 'ROW_NOT_FOUND',
             'full_source_row': full_row_data,
             'full_target_row': 'ROW_NOT_FOUND'
-        })
-    
-    return discrepancies, matched_target_indices
+        }]
+
+    return per_source, matched_target_indices, source_to_target
 
 
 def identify_missing_in_source_parallel(
-    args: Tuple[List[Any], pd.DataFrame, pd.DataFrame, List[str], List[str]]
+    args: Tuple[List[Any], Any, Any, List[str], List[str]]
 ) -> List[Dict[str, Any]]:
     """
     Identify rows that exist in target but not in source (MISSING_IN_SOURCE).
     Used for parallel processing.
 
+    Target data can be dicts (from DataFrame.to_dict('index')) or DataFrames.
+
     Args:
-        args: Tuple of (unmatched_indices, target_df, target_df_original,
+        args: Tuple of (unmatched_indices, target_dict_or_df, target_dict_original_or_df,
               compare_cols, key_cols)
 
     Returns:
         List of discrepancy dictionaries
     """
-    unmatched_indices, target_df, target_df_original, compare_cols, key_cols = args
+    unmatched_indices, target_data, target_data_original, compare_cols, key_cols = args
+    # Support both dict and DataFrame inputs
+    target_dict = target_data.to_dict('index') if isinstance(target_data, pd.DataFrame) else target_data
+    target_dict_original = target_data_original.to_dict('index') if isinstance(target_data_original, pd.DataFrame) else target_data_original
     discrepancies: List[Dict[str, Any]] = []
 
     for tgt_idx in unmatched_indices:
-        tgt_row = target_df.loc[tgt_idx]
-        tgt_row_original = target_df_original.loc[tgt_idx]
+        tgt_row = target_dict[tgt_idx]
+        tgt_row_original = target_dict_original[tgt_idx]
         key = _build_composite_key(tgt_row, key_cols)
         full_row_data = _build_full_row_string(tgt_row_original, compare_cols)
         discrepancies.append({
@@ -1587,8 +1633,12 @@ class HighPerformanceComparator:
         key_cols: List[str]
     ) -> None:
         """
-        Perform deep comparison using parallel processing.
-        Supports both exact and fuzzy key matching.
+        Perform deep comparison using true parallel processing.
+        All chunks are submitted at once; target index conflicts are resolved
+        post-hoc: the first chunk (by order) to claim a target index wins,
+        later chunks' matches to that same target become MISSING_IN_TARGET.
+
+        Target data is converted to dicts for efficient cross-process pickling.
 
         Args:
             source_df: Source DataFrame (normalised, unmatched rows only)
@@ -1604,77 +1654,103 @@ class HighPerformanceComparator:
         for indices in target_key_to_indices.values():
             all_target_indices.update(indices)
 
+        # Convert target DataFrames to dicts for efficient pickling
+        target_dict = target_df.to_dict('index')
+        target_dict_original = target_df_original.to_dict('index')
+
         chunk_size = max(500, len(source_df) // (self.num_workers * 8))
         chunks = [source_df.iloc[i:i + chunk_size] for i in range(0, len(source_df), chunk_size)]
         original_chunks = [source_df_original.iloc[i:i + chunk_size] for i in range(0, len(source_df_original), chunk_size)]
 
-        logger.info(f"  Processing {len(chunks)} chunks with {self.num_workers} workers...")
-
-        all_matched_target_indices: Set[Any] = set()
-        processed = 0
         total_chunks = len(chunks)
+        logger.info(f"  Processing {total_chunks} chunks with {self.num_workers} workers...")
 
         target_key_dict = dict(target_key_to_indices)
         target_fuzzy_key_dict = dict(target_fuzzy_key_to_indices)
 
+        # Submit ALL chunks at once for true parallel execution
         with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = []
             for chunk, original_chunk in zip(chunks, original_chunks):
-                # Filter target indices to exclude already-matched rows before each chunk.
-                # This prevents the race condition where multiple chunks independently
-                # match the same target row when duplicate source keys span chunks.
-                filtered_target_keys = {
-                    k: [idx for idx in v if idx not in all_matched_target_indices]
-                    for k, v in target_key_dict.items()
-                }
-                filtered_target_keys = {k: v for k, v in filtered_target_keys.items() if v}
-
-                filtered_fuzzy_keys = {
-                    k: [idx for idx in v if idx not in all_matched_target_indices]
-                    for k, v in target_fuzzy_key_dict.items()
-                }
-                filtered_fuzzy_keys = {k: v for k, v in filtered_fuzzy_keys.items() if v}
-
                 args = (
                     chunk, original_chunk,
-                    filtered_target_keys, filtered_fuzzy_keys,
-                    target_df, target_df_original,
+                    target_key_dict, target_fuzzy_key_dict,
+                    target_dict, target_dict_original,
                     compare_cols, key_cols,
                     self.skip_normalisation, self.decimal_precision
                 )
-                future = executor.submit(compare_rows_parallel, args)
-                chunk_discrepancies, matched_indices = future.result()
-                self.discrepancies.extend(chunk_discrepancies)
-                all_matched_target_indices.update(matched_indices)
-                processed += 1
+                futures.append(executor.submit(compare_rows_parallel, args))
 
+            # Collect results in chunk order (preserves deterministic conflict resolution)
+            results = []
+            for i, future in enumerate(futures):
+                result = future.result()
+                results.append(result)
+                processed = i + 1
                 if processed % max(1, total_chunks // 10) == 0 or processed == total_chunks:
                     pct = (processed / total_chunks) * 100
                     logger.info(f"    Progress: {processed}/{total_chunks} chunks ({pct:.0f}%)")
 
+        # Resolve cross-chunk conflicts: first chunk to claim a target index wins
+        all_matched_target_indices: Set[Any] = set()
+
+        for per_source, chunk_matched, chunk_s2t in results:
+            for src_idx, tgt_idx in chunk_s2t.items():
+                if tgt_idx not in all_matched_target_indices:
+                    # This chunk's claim is valid
+                    all_matched_target_indices.add(tgt_idx)
+                    # Emit any discrepancies for this source row
+                    if src_idx in per_source:
+                        self.discrepancies.extend(per_source[src_idx])
+                else:
+                    # Conflict: target already claimed by an earlier chunk.
+                    # Convert this source row to MISSING_IN_TARGET.
+                    src_key = None
+                    if src_idx in per_source and per_source[src_idx]:
+                        src_key = per_source[src_idx][0].get('composite_key', '')
+                        full_source_row = per_source[src_idx][0].get('full_source_row', '')
+                    else:
+                        full_source_row = ''
+                        src_key = ''
+                    self.discrepancies.append({
+                        'discrepancy_type': 'MISSING_IN_TARGET',
+                        'composite_key': src_key,
+                        'column_name': 'ALL',
+                        'source_value': full_source_row,
+                        'target_value': 'ROW_NOT_FOUND',
+                        'full_source_row': full_source_row,
+                        'full_target_row': 'ROW_NOT_FOUND'
+                    })
+
+            # Emit discrepancies for unmatched source rows (no target found by this chunk)
+            for src_idx, discs in per_source.items():
+                if src_idx not in chunk_s2t:
+                    self.discrepancies.extend(discs)
+
         logger.info("  Identifying rows only in target (parallel)...")
         unmatched_target_indices = all_target_indices - all_matched_target_indices
-        
+
         if unmatched_target_indices:
             # Convert to list and chunk for parallel processing
             unmatched_list = list(unmatched_target_indices)
             chunk_size = max(500, len(unmatched_list) // (self.num_workers * 4))
             unmatched_chunks = [
-                unmatched_list[i:i + chunk_size] 
+                unmatched_list[i:i + chunk_size]
                 for i in range(0, len(unmatched_list), chunk_size)
             ]
-            
+
             logger.info(f"    Processing {len(unmatched_list):,} unmatched rows in {len(unmatched_chunks)} chunks...")
-            
+
             with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
                 futures = []
                 for chunk in unmatched_chunks:
-                    args = (chunk, target_df, target_df_original, compare_cols, key_cols)
+                    args = (chunk, target_dict, target_dict_original, compare_cols, key_cols)
                     futures.append(executor.submit(identify_missing_in_source_parallel, args))
-                
+
                 for future in as_completed(futures):
                     chunk_discrepancies = future.result()
                     self.discrepancies.extend(chunk_discrepancies)
-        
+
         matched_count = len(all_matched_target_indices)
         missing_in_target = len(source_df) - matched_count
         missing_in_source = len(unmatched_target_indices)
@@ -2041,8 +2117,11 @@ def main() -> None:
 
     logger.info("\n" + "-" * 40)
     logger.info("Loading files...")
-    source_df = load_csv_file(source_file, "Source (Hive)", escape_char)
-    target_df = load_csv_file(target_file, "Target (Snowflake)", escape_char)
+    try:
+        source_df = load_csv_file(source_file, "Source (Hive)", escape_char)
+        target_df = load_csv_file(target_file, "Target (Snowflake)", escape_char)
+    except CSVComparatorError:
+        sys.exit(1)
 
     comparator = HighPerformanceComparator(
         source_df, target_df, key_columns, skip_normalisation, decimal_precision=decimal_precision
